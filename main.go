@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,6 +72,7 @@ type PanelState struct {
 	ProxyMode       string        `json:"proxy_mode"`        // "rule", "global", "direct"
 	ActiveNode      string        `json:"active_node"`
 	SubURL          string        `json:"sub_url"`
+	SubInsecure     bool          `json:"sub_insecure"`      // Ignore SSL/TLS cert errors
 	AutoUpdateHours int           `json:"auto_update_hours"` // 0 = disabled
 	LastSubUpdate   string        `json:"last_sub_update"`
 	AppFilterMode   string        `json:"app_filter_mode"` // "bypass" or "proxy"
@@ -113,6 +115,7 @@ var (
 	useTproxy    bool
 	xrayStopCh   chan struct{}
 	xrayDoneCh   chan struct{}
+	portHopRe    = regexp.MustCompile(`:(\d+)[-,][0-9,-]*([/?#].*|$)`)
 )
 
 func runCmd(name string, args ...string) error {
@@ -849,25 +852,125 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 		}, nil
 	}
 
-	u, err := url.Parse(rawURI)
+	normalizedURI := portHopRe.ReplaceAllString(rawURI, ":$1$2")
+	u, err := url.Parse(normalizedURI)
 	if err != nil {
 		return NodeProfile{}, fmt.Errorf("invalid URI: %v", err)
 	}
 	proto := strings.ToLower(u.Scheme)
-	if proto != "vless" && proto != "trojan" {
+	if proto != "vless" && proto != "trojan" && proto != "hysteria" && proto != "hysteria2" && proto != "hy2" {
 		return NodeProfile{}, fmt.Errorf("unsupported scheme %q", proto)
 	}
 
 	addr := u.Hostname()
-	port, err := strconv.Atoi(u.Port())
+	portStr := u.Port()
+	if idx := strings.IndexAny(portStr, "-,"); idx != -1 {
+		portStr = portStr[:idx]
+	}
+	port, err := strconv.Atoi(portStr)
 	if err != nil || port == 0 {
 		port = 443
 	}
-	userID := u.User.Username()
+
+	var userID string
+	if u.User != nil {
+		userID = u.User.Username()
+	}
+
 	q := u.Query()
 	name := u.Fragment
 	if name == "" {
 		name = fmt.Sprintf("%s-%s:%d", proto, addr, port)
+	}
+
+	if proto == "hysteria" || proto == "hysteria2" || proto == "hy2" {
+		auth := userID
+		if u.User != nil {
+			if pw, hasPw := u.User.Password(); hasPw {
+				auth = userID + ":" + pw
+			}
+		}
+		if auth == "" {
+			auth = q.Get("auth")
+		}
+
+		sni := q.Get("sni")
+		if sni == "" {
+			sni = q.Get("peer")
+		}
+		if sni == "" {
+			sni = addr
+		}
+
+		insecureVal := q.Get("insecure")
+		if insecureVal == "" {
+			insecureVal = q.Get("allowInsecure")
+		}
+		allowInsecure := insecureVal == "1" || strings.ToLower(insecureVal) == "true"
+
+		alpnList := []interface{}{"h3"}
+		if alpn := q.Get("alpn"); alpn != "" {
+			var parts []interface{}
+			for _, p := range strings.Split(alpn, ",") {
+				if trimmed := strings.TrimSpace(p); trimmed != "" {
+					parts = append(parts, trimmed)
+				}
+			}
+			if len(parts) > 0 {
+				alpnList = parts
+			}
+		}
+
+		tlsSettings := map[string]interface{}{
+			"serverName":    sni,
+			"alpn":          alpnList,
+			"allowInsecure": allowInsecure,
+		}
+		if pin := q.Get("pinSHA256"); pin != "" {
+			tlsSettings["pinnedPeerCertificateSha256"] = pin
+		}
+
+		hysteriaSettings := map[string]interface{}{
+			"version": 2,
+			"auth":    auth,
+		}
+
+		ss := map[string]interface{}{
+			"network":          "hysteria",
+			"security":         "tls",
+			"tlsSettings":      tlsSettings,
+			"hysteriaSettings": hysteriaSettings,
+		}
+
+		obfsType := q.Get("obfs")
+		obfsPass := q.Get("obfs-password")
+		if obfsType != "" && obfsPass != "" {
+			ss["finalmask"] = map[string]interface{}{
+				"udp": []interface{}{
+					map[string]interface{}{
+						"type": obfsType,
+						"settings": map[string]interface{}{
+							"password": obfsPass,
+						},
+					},
+				},
+			}
+		}
+
+		ob := map[string]interface{}{
+			"tag":      "proxy",
+			"protocol": "hysteria",
+			"settings": map[string]interface{}{
+				"version": 2,
+				"address": addr,
+				"port":    port,
+			},
+			"streamSettings": ss,
+		}
+
+		return NodeProfile{
+			ID: id, Name: name, Group: group, Protocol: "hysteria2", Address: addr, Port: port, Outbound: ob,
+		}, nil
 	}
 
 	netType := q.Get("type")
@@ -978,17 +1081,24 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 	}, nil
 }
 
-func updateSubscription(subURL string) (int, error) {
+func updateSubscription(subURL string, insecure bool) (int, error) {
 	subURL = strings.TrimSpace(subURL)
 	if subURL == "" {
 		return 0, fmt.Errorf("subscription URL is empty")
 	}
 
+	tr := &http.Transport{
+		DialContext: directDialer(12 * time.Second).DialContext,
+	}
+	if insecure {
+		tr.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+
 	client := &http.Client{
-		Timeout: 20 * time.Second,
-		Transport: &http.Transport{
-			DialContext: directDialer(12 * time.Second).DialContext,
-		},
+		Timeout:   20 * time.Second,
+		Transport: tr,
 	}
 
 	req, err := http.NewRequest(http.MethodGet, subURL, nil)
@@ -1031,7 +1141,7 @@ func updateSubscription(subURL string) (int, error) {
 	}
 
 	if len(parsedNodes) == 0 {
-		return 0, fmt.Errorf("no valid vless/trojan/vmess/ss nodes found in subscription")
+		return 0, fmt.Errorf("no valid vless/trojan/vmess/ss/hysteria nodes found in subscription")
 	}
 
 	st := loadState()
@@ -1076,7 +1186,7 @@ func subscriptionAutoUpdater() {
 			}
 		}
 		if needUpdate {
-			if count, err := updateSubscription(st.SubURL); err == nil && count > 0 {
+			if count, err := updateSubscription(st.SubURL, st.SubInsecure); err == nil && count > 0 {
 				_ = restartProxyEngine()
 			}
 		}
@@ -1090,6 +1200,18 @@ func measureNodeLatency(n NodeProfile) int {
 	start := time.Now()
 	conn, err := dialer.Dial("tcp", target)
 	if err != nil {
+		if n.Protocol == "hysteria2" || n.Protocol == "hysteria" {
+			uConn, uErr := dialer.Dial("udp", target)
+			if uErr != nil {
+				return -1
+			}
+			_ = uConn.Close()
+			ms := int(time.Since(start).Milliseconds())
+			if ms < 1 {
+				ms = 1
+			}
+			return ms
+		}
 		return -1
 	}
 	defer conn.Close()
@@ -1272,6 +1394,7 @@ func startWebDashboard() {
 		var req struct {
 			SubURL          string `json:"sub_url"`
 			AutoUpdateHours int    `json:"auto_update_hours"`
+			SubInsecure     bool   `json:"sub_insecure"`
 			FetchNow        bool   `json:"fetch_now"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1281,11 +1404,12 @@ func startWebDashboard() {
 		st := loadState()
 		st.SubURL = strings.TrimSpace(req.SubURL)
 		st.AutoUpdateHours = req.AutoUpdateHours
+		st.SubInsecure = req.SubInsecure
 		_ = saveState(st)
 
 		w.Header().Set("Content-Type", "application/json")
 		if req.FetchNow {
-			count, err := updateSubscription(st.SubURL)
+			count, err := updateSubscription(st.SubURL, st.SubInsecure)
 			if err != nil {
 				w.WriteHeader(http.StatusBadRequest)
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -1645,6 +1769,11 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 <div id="p-nodes" class="card">
   <div class="title" style="font-size:13px;margin-bottom:6px">Subscription URL (Direct WAN Fetch)</div>
   <input id="subUrlInput" type="text" placeholder="https://example.com/sub/...">
+  <div class="row" style="margin-bottom:8px">
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#cbd5e1;cursor:pointer">
+      <input id="subInsecureChk" type="checkbox" style="width:auto;margin:0"> Ignore SSL / TLS certificate errors
+    </label>
+  </div>
   <div class="row" style="margin-bottom:10px">
     <select id="subAutoSel" style="width:auto;margin:0;flex:1">
       <option value="0">Auto-Update: Off</option>
@@ -1658,7 +1787,7 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
   <div class="meta" id="subMeta">Last updated: Never</div>
 
   <div class="title" style="font-size:13px;margin:10px 0 6px">Manual URI Import</div>
-  <input id="uriInput" type="text" placeholder="vless:// | trojan:// | vmess:// | ss://">
+  <input id="uriInput" type="text" placeholder="vless:// | trojan:// | vmess:// | ss:// | hysteria2:// | hy2://">
   <button class="btn-green" style="width:100%;margin-bottom:12px" onclick="importURI()">Import &amp; Connect</button>
 
   <div class="header">
@@ -1750,6 +1879,7 @@ function refreshStatus() {
     if (!subInitialized) {
       document.getElementById("subUrlInput").value = d.sub_url || "";
       document.getElementById("subAutoSel").value = String(d.auto_update_hours || 0);
+      document.getElementById("subInsecureChk").checked = !!d.sub_insecure;
       subInitialized = true;
     }
     document.getElementById("subMeta").innerHTML =
@@ -1812,8 +1942,9 @@ function setMode(mode) {
 function saveSub(fetchNow) {
   var u = document.getElementById("subUrlInput").value;
   var hrs = parseInt(document.getElementById("subAutoSel").value, 10) || 0;
+  var insecure = document.getElementById("subInsecureChk").checked;
   if (fetchNow) { showMsg("Fetching subscription over direct WAN..."); }
-  req("POST", "/api/sub", {sub_url: u, auto_update_hours: hrs, fetch_now: fetchNow}, function(code, text) {
+  req("POST", "/api/sub", {sub_url: u, auto_update_hours: hrs, sub_insecure: insecure, fetch_now: fetchNow}, function(code, text) {
     if (code === 200) {
       var res = JSON.parse(text);
       showMsg(fetchNow ? ("Imported " + res.imported + " subscription nodes.") : "Subscription settings saved.");

@@ -12,8 +12,8 @@ OpenWrt Passwall-style transparent proxy module for Android 6.0 through Android 
 - **Android 12+ eBPF Offload Bypass & Netd Watchdog:** Disables `tether_offload_disabled` so hotspot traffic traverses Netfilter, and restores rules if Android resets tables during network switches.
 - **Embedded Web Control Panel (`http://127.0.0.1:9090`):**
   - Switch routing modes (`Rule`, `Global`, `Direct`).
-  - Import `vless://` (including `xhttp`, `ws`, `grpc`, `tls`, `reality`), `trojan://`, `vmess://`, and `ss://` links.
-  - Fetch Base64/plain subscription URLs over direct WAN (`SO_MARK 0x02000000`) with scheduled background auto-updates.
+  - Import `vless://` (including `xhttp`, `ws`, `grpc`, `tls`, `reality`), `trojan://`, `vmess://`, `ss://`, and `hysteria2://` / `hy2://` links.
+  - Fetch Base64/plain subscription URLs over direct WAN (`SO_MARK 0x02000000`) with optional SSL/TLS certificate verification bypass and scheduled background auto-updates.
   - Concurrent TCP/TLS latency tester with one-tap **Fastest** node selection.
   - Per-app UID split tunneling (`Bypass Selected` or `Proxy Only Selected`) while keeping hotspot clients proxied.
 

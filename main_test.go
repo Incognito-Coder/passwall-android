@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -241,5 +243,112 @@ func TestCappedLogWriter(t *testing.T) {
 	}
 	if string(content) != string(msg) {
 		t.Errorf("expected %q, got %q", string(msg), string(content))
+	}
+}
+
+func TestParseShareURIHysteria(t *testing.T) {
+	t.Run("Hysteria 2 Standard", func(t *testing.T) {
+		uri := "hysteria2://mypassword@hy2.example.com:443?sni=sni.example.com&insecure=1&alpn=h3#MyHysteria2Node"
+		node, err := parseShareURI(uri, "manual")
+		if err != nil {
+			t.Fatalf("parseShareURI failed: %v", err)
+		}
+
+		if node.Protocol != "hysteria2" {
+			t.Errorf("expected protocol hysteria2, got %s", node.Protocol)
+		}
+		if node.Address != "hy2.example.com" || node.Port != 443 {
+			t.Errorf("unexpected addr:port %s:%d", node.Address, node.Port)
+		}
+		if node.Name != "MyHysteria2Node" {
+			t.Errorf("unexpected name %s", node.Name)
+		}
+
+		ob := node.Outbound
+		if ob["protocol"] != "hysteria" {
+			t.Errorf("outbound protocol mismatch: %v", ob["protocol"])
+		}
+
+		ss, _ := ob["streamSettings"].(map[string]interface{})
+		if ss["network"] != "hysteria" || ss["security"] != "tls" {
+			t.Fatalf("stream settings mismatch: %v", ss)
+		}
+
+		tlsSet, _ := ss["tlsSettings"].(map[string]interface{})
+		if tlsSet["serverName"] != "sni.example.com" || tlsSet["allowInsecure"] != true {
+			t.Errorf("tls settings mismatch: %v", tlsSet)
+		}
+
+		hySet, _ := ss["hysteriaSettings"].(map[string]interface{})
+		if hySet["auth"] != "mypassword" || hySet["version"] != 2 {
+			t.Errorf("hysteria settings mismatch: %v", hySet)
+		}
+	})
+
+	t.Run("Hysteria 2 with Obfuscation & hy2 scheme", func(t *testing.T) {
+		uri := "hy2://token123@198.51.100.5:8443?obfs=salamander&obfs-password=mask12345#ObfsHy2"
+		node, err := parseShareURI(uri, "sub")
+		if err != nil {
+			t.Fatalf("parseShareURI hy2 failed: %v", err)
+		}
+
+		if node.Protocol != "hysteria2" || node.Port != 8443 {
+			t.Errorf("expected hysteria2:8443, got %s:%d", node.Protocol, node.Port)
+		}
+
+		ss, _ := node.Outbound["streamSettings"].(map[string]interface{})
+		finalmask, ok := ss["finalmask"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected finalmask for obfuscation, got: %v", ss)
+		}
+		udpArr, _ := finalmask["udp"].([]interface{})
+		if len(udpArr) == 0 {
+			t.Fatalf("finalmask udp empty")
+		}
+		udpEntry := udpArr[0].(map[string]interface{})
+		if udpEntry["type"] != "salamander" {
+			t.Errorf("expected salamander type, got %v", udpEntry["type"])
+		}
+	})
+
+	t.Run("Hysteria 1 / legacy format with port range hopping", func(t *testing.T) {
+		uri := "hysteria://hy.server.net:20000-40000?auth=legacyauth&insecure=1#LegacyHysteria"
+		node, err := parseShareURI(uri, "manual")
+		if err != nil {
+			t.Fatalf("parse legacy hysteria failed: %v", err)
+		}
+
+		if node.Port != 20000 {
+			t.Errorf("expected base hopping port 20000, got %d", node.Port)
+		}
+
+		ss := node.Outbound["streamSettings"].(map[string]interface{})
+		hySet := ss["hysteriaSettings"].(map[string]interface{})
+		if hySet["auth"] != "legacyauth" {
+			t.Errorf("expected legacyauth, got %v", hySet["auth"])
+		}
+	})
+}
+
+func TestUpdateSubscriptionWithInsecureSSL(t *testing.T) {
+	payload := "vless://uuid@1.2.3.4:443?security=none#Node1\nhy2://pass@5.6.7.8:443#Node2\n"
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer ts.Close()
+
+	// 1. With insecure=false, self-signed certificate should fail verification
+	_, err := updateSubscription(ts.URL, false)
+	if err == nil {
+		t.Fatal("expected SSL verification error when insecure=false, but got nil")
+	}
+
+	// 2. With insecure=true, it should bypass SSL verification and succeed
+	count, err := updateSubscription(ts.URL, true)
+	if err != nil {
+		t.Fatalf("unexpected error with insecure=true: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 imported nodes, got %d", count)
 	}
 }
