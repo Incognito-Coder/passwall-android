@@ -1,0 +1,15 @@
+# Build and distribution artifacts
+dist/
+tmp_dl/
+*.zip
+*.sha256
+
+# Binaries
+passwall-droid
+*.exe
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

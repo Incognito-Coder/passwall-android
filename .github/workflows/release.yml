@@ -1,0 +1,89 @@
+name: Build & Release Passwall Android Magisk Module
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  schedule:
+    # Check daily at 04:00 UTC for new XTLS/Xray-core releases
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      xray_version:
+        description: 'Optional Xray-core tag (leave empty for latest)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Resolve latest Xray-core release tag
+        id: xray
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VER: ${{ github.event.inputs.xray_version }}
+        run: |
+          if [ -n "$INPUT_VER" ]; then
+            TAG="$INPUT_VER"
+          else
+            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN"               "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=1"               | jq -r '.[0].tag_name // empty')
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            TAG="v26.11.9"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved Xray-core tag: $TAG"
+
+      - name: Check if scheduled release already exists
+        id: check_rel
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REL_TAG="xray-${{ steps.xray.outputs.tag }}"
+          if gh release view "$REL_TAG" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release $REL_TAG already published; skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build universal Magisk ZIP (ARMv7 + ARM64)
+        if: steps.check_rel.outputs.skip != 'true'
+        env:
+          XRAY_VER: ${{ steps.xray.outputs.tag }}
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            MOD_VER="${GITHUB_REF_NAME}"
+          else
+            MOD_VER="v1.2.0-${XRAY_VER}"
+          fi
+          echo "MOD_VER=${MOD_VER}" >> "$GITHUB_ENV"
+          chmod +x build.sh
+          MOD_VERSION="${MOD_VER}" ./build.sh
+          sha256sum "passwall-android-${MOD_VER}-universal.zip" > "passwall-android-${MOD_VER}-universal.zip.sha256"
+
+      - name: Publish GitHub Release
+        if: steps.check_rel.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('xray-{0}', steps.xray.outputs.tag) }}
+          name: Passwall Android ${{ env.MOD_VER }} (Xray ${{ steps.xray.outputs.tag }})
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            passwall-android-${{ env.MOD_VER }}-universal.zip
+            passwall-android-${{ env.MOD_VER }}-universal.zip.sha256
