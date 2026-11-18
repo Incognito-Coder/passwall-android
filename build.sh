@@ -28,8 +28,8 @@ rm -rf dist
 mkdir -p "$OUT_DIR/bin/arm" "$OUT_DIR/bin/arm64" "$OUT_DIR/config" "${CACHE_DIR}/arm" "${CACHE_DIR}/arm64" .cache/downloads
 
 # 1. Cross-compile static passwall-droid binaries (ARMv7 Android 6+ & ARM64)
-GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -ldflags="-s -w" -o "$OUT_DIR/bin/arm/passwall-droid" .
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o "$OUT_DIR/bin/arm64/passwall-droid" .
+GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -ldflags="-s -w -X main.AppVersion=${MOD_VERSION}" -o "$OUT_DIR/bin/arm/passwall-droid" .
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w -X main.AppVersion=${MOD_VERSION}" -o "$OUT_DIR/bin/arm64/passwall-droid" .
 
 # 2. Download official Xray-core ARMv7 & ARM64 binaries (with local caching)
 if [ ! -f "${CACHE_DIR}/arm/xray" ]; then

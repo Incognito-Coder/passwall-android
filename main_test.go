@@ -633,3 +633,95 @@ func TestPrepareRuntimeConfigRoutingModes(t *testing.T) {
 		}
 	})
 }
+
+func TestGetModuleVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBaseDir := BaseDir
+	origAppVer := AppVersion
+	defer func() {
+		BaseDir = origBaseDir
+		AppVersion = origAppVer
+	}()
+
+	BaseDir = tmpDir
+
+	// 1. When module.prop exists
+	propContent := "id=passwall-android\nname=Passwall\nversion=v1.2.9\nversionCode=129\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "module.prop"), []byte(propContent), 0644); err != nil {
+		t.Fatalf("failed to write module.prop: %v", err)
+	}
+	if v := getModuleVersion(); v != "v1.2.9" {
+		t.Errorf("expected version v1.2.9 from module.prop, got %q", v)
+	}
+
+	// 2. When module.prop does not exist, fall back to AppVersion
+	_ = os.Remove(filepath.Join(tmpDir, "module.prop"))
+	AppVersion = "v2.0.0-custom"
+	if v := getModuleVersion(); v != "v2.0.0-custom" {
+		t.Errorf("expected fallback to AppVersion v2.0.0-custom, got %q", v)
+	}
+}
+
+func TestGetXrayVersion(t *testing.T) {
+	origXray := XrayBin
+	defer func() {
+		XrayBin = origXray
+		invalidateXrayVersion()
+	}()
+
+	invalidateXrayVersion()
+
+	// 1. Non-existent binary returns "Unknown"
+	XrayBin = "/non/existent/xray/bin"
+	if v := getXrayVersion(); v != "Unknown" {
+		t.Errorf("expected Unknown for missing binary, got %q", v)
+	}
+}
+
+func TestApiStatusIncludesVersions(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBaseDir := BaseDir
+	origState := StateFile
+	defer func() {
+		BaseDir = origBaseDir
+		StateFile = origState
+	}()
+
+	BaseDir = tmpDir
+	StateFile = filepath.Join(tmpDir, "state.json")
+
+	propContent := "id=passwall-android\nversion=v1.2.1\nversionCode=121\n"
+	_ = os.WriteFile(filepath.Join(tmpDir, "module.prop"), []byte(propContent), 0644)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		st := loadState()
+		resp := map[string]interface{}{
+			"running":        false,
+			"module_version": getModuleVersion(),
+			"xray_version":   getXrayVersion(),
+			"dns":            st.DNS,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+
+	var res map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal status response failed: %v", err)
+	}
+
+	if res["module_version"] != "v1.2.1" {
+		t.Errorf("expected module_version v1.2.1, got %v", res["module_version"])
+	}
+	if _, ok := res["xray_version"]; !ok {
+		t.Error("expected xray_version field in status response")
+	}
+}

@@ -35,6 +35,7 @@ var (
 	PidFile       = "/dev/passwall-droid.pid"
 	PackagesFile  = "/data/system/packages.list"
 	WebListenAddr = "127.0.0.1:9090"
+	AppVersion    = "v1.2.1"
 )
 
 const (
@@ -142,6 +143,74 @@ func runCmdIgnoreErr(name string, args ...string) {
 
 func writeSysctl(path, val string) {
 	_ = os.WriteFile(path, []byte(val), 0644)
+}
+
+var (
+	xrayVerMu     sync.Mutex
+	cachedXrayVer string
+)
+
+func getModuleVersion() string {
+	propFile := filepath.Join(BaseDir, "module.prop")
+	if data, err := os.ReadFile(propFile); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "version=") {
+				ver := strings.TrimPrefix(line, "version=")
+				if ver != "" {
+					return ver
+				}
+			}
+		}
+	}
+	if AppVersion != "" {
+		return AppVersion
+	}
+	return "v1.2.1"
+}
+
+func getXrayVersion() string {
+	xrayVerMu.Lock()
+	defer xrayVerMu.Unlock()
+	if cachedXrayVer != "" && cachedXrayVer != "Unknown" {
+		return cachedXrayVer
+	}
+
+	cmd := exec.Command(XrayBin, "version")
+	out, err := cmd.Output()
+	if err != nil {
+		cmd = exec.Command(XrayBin, "-version")
+		out, err = cmd.Output()
+	}
+	if err != nil {
+		cachedXrayVer = "Unknown"
+		return cachedXrayVer
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) > 0 {
+		firstLine := strings.TrimSpace(lines[0])
+		fields := strings.Fields(firstLine)
+		if len(fields) >= 2 && strings.EqualFold(fields[0], "Xray") {
+			cachedXrayVer = "v" + strings.TrimPrefix(fields[1], "v")
+		} else if firstLine != "" {
+			if len(firstLine) > 36 {
+				firstLine = firstLine[:36]
+			}
+			cachedXrayVer = firstLine
+		} else {
+			cachedXrayVer = "Unknown"
+		}
+	} else {
+		cachedXrayVer = "Unknown"
+	}
+	return cachedXrayVer
+}
+
+func invalidateXrayVersion() {
+	xrayVerMu.Lock()
+	cachedXrayVer = ""
+	xrayVerMu.Unlock()
 }
 
 func directDialer(timeout time.Duration) *net.Dialer {
@@ -892,6 +961,7 @@ func startProxyEngine() error {
 
 	cleanupIptables()
 	configureKernelAndTether()
+	invalidateXrayVersion()
 
 	if err := prepareRuntimeConfig(useTproxy); err != nil {
 		return err
@@ -1621,6 +1691,8 @@ func startWebDashboard() {
 			"app_filter_mode":   st.AppFilterMode,
 			"selected_uids":     st.SelectedUIDs,
 			"dns":               st.DNS,
+			"module_version":    getModuleVersion(),
+			"xray_version":      getXrayVersion(),
 			"nodes":             st.Nodes,
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -2063,10 +2135,13 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 
 <div class="card">
   <div class="header">
-    <div class="title">Passwall Android</div>
+    <div class="title" style="display:flex;align-items:center;gap:6px">
+      <span>Passwall Android</span>
+      <span id="modVerBadge" style="font-size:11px;padding:2px 6px;border-radius:5px;background:#334155;color:#94a3b8;font-weight:600">--</span>
+    </div>
     <span id="statusBadge" class="badge off">LOADING</span>
   </div>
-  <div class="meta" id="metaLine">Netfilter: -- | PID: --</div>
+  <div class="meta" id="metaLine">Xray: -- | Netfilter: -- | PID: --</div>
   <div class="row">
     <button class="btn-green" onclick="ctrl('start')">Start</button>
     <button class="btn-blue" onclick="ctrl('restart')">Restart</button>
@@ -2259,8 +2334,9 @@ function refreshStatus() {
     var b = document.getElementById("statusBadge");
     b.innerHTML = d.running ? "RUNNING" : "STOPPED";
     b.className = d.running ? "badge on" : "badge off";
+    document.getElementById("modVerBadge").innerHTML = esc(d.module_version || "v1.2.1");
     document.getElementById("metaLine").innerHTML =
-      "Netfilter: " + d.net_mode + " | PID: " + d.daemon_pid;
+      "Xray: " + esc(d.xray_version || "Unknown") + " | Netfilter: " + esc(d.net_mode) + " | PID: " + d.daemon_pid;
 
     var modes = ["rule", "global", "direct"];
     for (var i = 0; i < modes.length; i++) {
