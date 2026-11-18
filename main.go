@@ -35,7 +35,7 @@ var (
 	PidFile       = "/dev/passwall-droid.pid"
 	PackagesFile  = "/data/system/packages.list"
 	WebListenAddr = "127.0.0.1:9090"
-	AppVersion    = "v1.2.1"
+	AppVersion    = "v1.2.2"
 
 	PersistDir        = "/data/adb/passwall"
 	PersistBaseConfig = PersistDir + "/config.json"
@@ -327,8 +327,8 @@ func loadState() PanelState {
 	if st.DNS.RemoteDNS == "" {
 		st.DNS.RemoteDNS = "tcp://1.1.1.1"
 	}
-	if st.DNS.DirectDNS == "" {
-		st.DNS.DirectDNS = "223.5.5.5"
+	if st.DNS.DirectDNS == "" || st.DNS.DirectDNS == "223.5.5.5" {
+		st.DNS.DirectDNS = "1.1.1.1"
 	}
 	if st.DNS.QueryStrategy == "" {
 		st.DNS.QueryStrategy = "UseIPv4"
@@ -415,8 +415,8 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		remoteDNS = "tcp://1.1.1.1"
 	}
 	directDNS := strings.TrimSpace(st.DNS.DirectDNS)
-	if directDNS == "" {
-		directDNS = "223.5.5.5"
+	if directDNS == "" || directDNS == "223.5.5.5" {
+		directDNS = "1.1.1.1"
 	}
 	queryStrategy := strings.TrimSpace(st.DNS.QueryStrategy)
 	if queryStrategy == "" {
@@ -444,7 +444,7 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 	}
 
 	// Prepare direct domains (domestic Iranian/CN domains, node domain, sub domain)
-	directDomains := []string{"domain:ir", "geosite:ir", "geosite:cn"}
+	directDomains := []string{"domain:ir", "geosite:ir", "geosite:category-ir", "geosite:cn"}
 	if activeNodeDomain != "" {
 		directDomains = append(directDomains, activeNodeDomain)
 	}
@@ -464,30 +464,32 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		if defaultOutbound == "direct" {
 			dnsServers = []interface{}{
 				directDNS,
-				"223.5.5.5",
-				"8.8.8.8",
+				"1.1.1.1",
+				"localhost",
 			}
 		} else {
 			dnsServers = []interface{}{
-				map[string]interface{}{
-					"address": remoteDNS,
-					"domains": []string{"geosite:geolocation-!cn"},
-				},
 				map[string]interface{}{
 					"address":      directDNS,
 					"domains":      directDomains,
 					"skipFallback": true,
 				},
+				map[string]interface{}{
+					"address": remoteDNS,
+					"domains": []string{"geosite:geolocation-!cn"},
+				},
 				remoteDNS,
 				directDNS,
+				"1.1.1.1",
+				"localhost",
 			}
 		}
 	case "global":
 		if defaultOutbound == "direct" {
 			dnsServers = []interface{}{
 				directDNS,
-				"223.5.5.5",
-				"8.8.8.8",
+				"1.1.1.1",
+				"localhost",
 			}
 		} else {
 			dnsServers = []interface{}{
@@ -497,14 +499,14 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 					"skipFallback": true,
 				},
 				remoteDNS,
-				directDNS,
+				"localhost",
 			}
 		}
 	case "direct":
 		dnsServers = []interface{}{
 			directDNS,
-			"223.5.5.5",
-			"8.8.8.8",
+			"1.1.1.1",
+			"localhost",
 		}
 	}
 	cfg["dns"] = map[string]interface{}{
@@ -615,18 +617,25 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		"outboundTag": "dns-out",
 	})
 
-	// 2. Direct DNS server traffic must ALWAYS go to direct outbound
+	// 2. Direct DNS server traffic must ALWAYS go to direct outbound (port 53)
 	directHost := extractHost(directDNS)
+	remoteHost := extractHost(remoteDNS)
 	if net.ParseIP(directHost) != nil {
-		rules = append(rules, map[string]interface{}{
+		rule := map[string]interface{}{
 			"type":        "field",
 			"ip":          []string{directHost},
+			"port":        "53",
 			"outboundTag": "direct",
-		})
-	} else if directHost != "" {
+		}
+		if directHost == remoteHost && strings.HasPrefix(remoteDNS, "tcp://") {
+			rule["network"] = "udp"
+		}
+		rules = append(rules, rule)
+	} else if directHost != "" && directHost != "localhost" {
 		rules = append(rules, map[string]interface{}{
 			"type":        "field",
 			"domain":      []string{directHost},
+			"port":        "53",
 			"outboundTag": "direct",
 		})
 	}
@@ -673,7 +682,7 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 			},
 			map[string]interface{}{
 				"type":        "field",
-				"domain":      []string{"domain:ir", "geosite:ir", "geosite:cn"},
+				"domain":      []string{"domain:ir", "geosite:ir", "geosite:category-ir", "geosite:cn"},
 				"outboundTag": "direct",
 			},
 			map[string]interface{}{
@@ -1016,8 +1025,12 @@ func superviseXray(stopCh <-chan struct{}, doneCh chan<- struct{}) {
 
 		log.Println("[passwall-droid] starting xray-core...")
 		cmd := exec.Command(XrayBin, "run", "-c", RuntimeConfig)
+		cmd.Dir = AssetDir
 		cmd.Env = append(os.Environ(),
 			"XRAY_LOCATION_ASSET="+AssetDir,
+			"xray.location.asset="+AssetDir,
+			"V2RAY_LOCATION_ASSET="+AssetDir,
+			"v2ray.location.asset="+AssetDir,
 			"GOGC=40",
 			"GOMEMLIMIT=48MiB",
 		)
@@ -1117,6 +1130,7 @@ func stopProxyEngine() {
 
 func restartProxyEngine() error {
 	stopProxyEngine()
+	time.Sleep(150 * time.Millisecond)
 	return startProxyEngine()
 }
 
@@ -1922,10 +1936,27 @@ func startWebDashboard() {
 		st.ProxyMode = req.ProxyMode
 		_ = saveState(st)
 		log.Printf("[passwall-droid] routing mode set to %s", req.ProxyMode)
-		_ = restartProxyEngine()
+
+		engineMu.Lock()
+		active := engineActive
+		engineMu.Unlock()
+
+		var restartErr error
+		if active {
+			restartErr = restartProxyEngine()
+		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		if restartErr != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": restartErr.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":    "ok",
+			"mode":      req.ProxyMode,
+			"restarted": active,
+		})
 	})
 
 	mux.HandleFunc("/api/localhost_proxy", func(w http.ResponseWriter, r *http.Request) {
@@ -2376,7 +2407,7 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 <div class="card">
   <div class="title" style="font-size:13px;margin-bottom:6px">Routing Mode</div>
   <div class="row" style="margin-bottom:8px">
-    <button id="mode-rule" style="flex:1" onclick="setMode('rule')">Rule (Bypass IR/LAN)</button>
+    <button id="mode-rule" style="flex:1" onclick="setMode('rule')">Rule (Bypass IR)</button>
     <button id="mode-global" style="flex:1" onclick="setMode('global')">Global</button>
     <button id="mode-direct" style="flex:1" onclick="setMode('direct')">Direct</button>
   </div>
@@ -2436,20 +2467,22 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 
   <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Remote DNS (Proxied / Foreign)</div>
   <input id="dnsRemoteInput" type="text" placeholder="tcp://1.1.1.1">
-  <div class="row" style="margin-bottom:10px">
+  <div class="row" style="margin-bottom:10px;flex-wrap:wrap;gap:4px">
     <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','tcp://1.1.1.1')">1.1.1.1 (TCP)</button>
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','1.1.1.1')">1.1.1.1 (UDP)</button>
     <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','tcp://8.8.8.8')">8.8.8.8 (TCP)</button>
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','https://dns.google/dns-query')">Google DoH</button>
     <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','https://1.1.1.1/dns-query')">Cloudflare DoH</button>
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','https://dns.google/dns-query')">Google DoH</button>
   </div>
 
   <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Direct DNS (Domestic / Node Resolution)</div>
-  <input id="dnsDirectInput" type="text" placeholder="223.5.5.5">
-  <div class="row" style="margin-bottom:10px">
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','223.5.5.5')">223.5.5.5</button>
+  <input id="dnsDirectInput" type="text" placeholder="1.1.1.1">
+  <div class="row" style="margin-bottom:10px;flex-wrap:wrap;gap:4px">
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','1.1.1.1')">1.1.1.1 (Cloudflare UDP)</button>
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','localhost')">localhost (System DNS)</button>
     <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','10.202.10.202')">Shecan (10.202.10.202)</button>
     <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','77.88.8.8')">Yandex (77.88.8.8)</button>
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','8.8.8.8')">8.8.8.8</button>
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','223.5.5.5')">AliDNS (223.5.5.5)</button>
   </div>
 
   <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Query Strategy</div>
@@ -2536,7 +2569,7 @@ function loadDNS() {
     if (code !== 200) { return; }
     var d = JSON.parse(text);
     document.getElementById("dnsRemoteInput").value = d.remote_dns || "tcp://1.1.1.1";
-    document.getElementById("dnsDirectInput").value = d.direct_dns || "223.5.5.5";
+    document.getElementById("dnsDirectInput").value = d.direct_dns || "1.1.1.1";
     document.getElementById("dnsStrategySel").value = d.query_strategy || "UseIPv4";
     dnsInitialized = true;
   });
@@ -2703,10 +2736,19 @@ function ctrl(action) {
 }
 
 function setMode(mode) {
-  showMsg("Switching to " + mode + " mode...");
-  req("POST", "/api/mode", {proxy_mode: mode}, function(code) {
-    if (code === 200) { showMsg("Active mode: " + mode.toUpperCase()); }
-    refreshStatus();
+  var modes = ["rule", "global", "direct"];
+  for (var i = 0; i < modes.length; i++) {
+    var el = document.getElementById("mode-" + modes[i]);
+    if (el) el.className = (modes[i] === mode ? "btn-active" : "");
+  }
+  showMsg("Switching to " + mode.toUpperCase() + " mode and restarting engine...");
+  req("POST", "/api/mode", {proxy_mode: mode}, function(code, text) {
+    if (code === 200) {
+      showMsg("Active mode: " + mode.toUpperCase() + " (service restarted)");
+    } else {
+      showMsg("Mode update failed: " + text);
+    }
+    setTimeout(refreshStatus, 300);
   });
 }
 

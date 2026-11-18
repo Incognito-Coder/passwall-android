@@ -390,8 +390,8 @@ func TestLoadStateDNSDefaults(t *testing.T) {
 	if st.DNS.RemoteDNS != "tcp://1.1.1.1" {
 		t.Errorf("expected default remote DNS tcp://1.1.1.1, got %q", st.DNS.RemoteDNS)
 	}
-	if st.DNS.DirectDNS != "223.5.5.5" {
-		t.Errorf("expected default direct DNS 223.5.5.5, got %q", st.DNS.DirectDNS)
+	if st.DNS.DirectDNS != "1.1.1.1" {
+		t.Errorf("expected default direct DNS 1.1.1.1, got %q", st.DNS.DirectDNS)
 	}
 	if st.DNS.QueryStrategy != "UseIPv4" {
 		t.Errorf("expected default query strategy UseIPv4, got %q", st.DNS.QueryStrategy)
@@ -512,17 +512,23 @@ func TestPrepareRuntimeConfigRoutingModes(t *testing.T) {
 			t.Errorf("expected queryStrategy UseIPv4, got %v", dnsCfg["queryStrategy"])
 		}
 		servers := dnsCfg["servers"].([]interface{})
-		directEntry := servers[1].(map[string]interface{})
+		directEntry := servers[0].(map[string]interface{})
 		domains := directEntry["domains"].([]interface{})
 		foundNodeDomain := false
+		foundCategoryIR := false
 		for _, d := range domains {
 			if d == "myproxy.vpnserver.com" {
 				foundNodeDomain = true
-				break
+			}
+			if d == "geosite:category-ir" {
+				foundCategoryIR = true
 			}
 		}
 		if !foundNodeDomain {
 			t.Errorf("expected node domain in direct DNS domains, got: %v", domains)
+		}
+		if !foundCategoryIR {
+			t.Errorf("expected geosite:category-ir in direct DNS domains, got: %v", domains)
 		}
 
 		// Verify routing rules: DNS intercepted, direct DNS routed direct, node domain routed direct
@@ -531,6 +537,7 @@ func TestPrepareRuntimeConfigRoutingModes(t *testing.T) {
 		foundDNSOut := false
 		foundDirectDNSRule := false
 		foundNodeDomainRule := false
+		foundCategoryIRRule := false
 
 		for _, r := range rules {
 			rm := r.(map[string]interface{})
@@ -539,7 +546,7 @@ func TestPrepareRuntimeConfigRoutingModes(t *testing.T) {
 			}
 			if ips, ok := rm["ip"].([]interface{}); ok {
 				for _, ip := range ips {
-					if ip == "10.202.10.202" && rm["outboundTag"] == "direct" {
+					if ip == "10.202.10.202" && rm["outboundTag"] == "direct" && rm["port"] == "53" {
 						foundDirectDNSRule = true
 					}
 				}
@@ -549,6 +556,9 @@ func TestPrepareRuntimeConfigRoutingModes(t *testing.T) {
 					if dom == "myproxy.vpnserver.com" && rm["outboundTag"] == "direct" {
 						foundNodeDomainRule = true
 					}
+					if dom == "geosite:category-ir" && rm["outboundTag"] == "direct" {
+						foundCategoryIRRule = true
+					}
 				}
 			}
 		}
@@ -557,10 +567,13 @@ func TestPrepareRuntimeConfigRoutingModes(t *testing.T) {
 			t.Error("expected port 53 dns-out interception rule")
 		}
 		if !foundDirectDNSRule {
-			t.Error("expected direct DNS IP direct routing rule")
+			t.Error("expected direct DNS IP direct routing rule with port 53")
 		}
 		if !foundNodeDomainRule {
 			t.Error("expected proxy node domain direct routing rule to prevent deadlock")
+		}
+		if !foundCategoryIRRule {
+			t.Error("expected geosite:category-ir in routing direct domains")
 		}
 	})
 
@@ -691,7 +704,7 @@ func TestApiStatusIncludesVersions(t *testing.T) {
 	BaseDir = tmpDir
 	StateFile = filepath.Join(tmpDir, "state.json")
 
-	propContent := "id=passwall-android\nversion=v1.2.1\nversionCode=121\n"
+	propContent := "id=passwall-android\nversion=v1.2.2\nversionCode=122\n"
 	_ = os.WriteFile(filepath.Join(tmpDir, "module.prop"), []byte(propContent), 0644)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -719,8 +732,8 @@ func TestApiStatusIncludesVersions(t *testing.T) {
 		t.Fatalf("unmarshal status response failed: %v", err)
 	}
 
-	if res["module_version"] != "v1.2.1" {
-		t.Errorf("expected module_version v1.2.1, got %v", res["module_version"])
+	if res["module_version"] != "v1.2.2" {
+		t.Errorf("expected module_version v1.2.2, got %v", res["module_version"])
 	}
 	if _, ok := res["xray_version"]; !ok {
 		t.Error("expected xray_version field in status response")
@@ -1081,5 +1094,139 @@ func TestApiLocalhostProxyAndConnectivityEndpoints(t *testing.T) {
 	}
 	if connRes.Google.Status != "Proxy stopped" {
 		t.Errorf("expected status 'Proxy stopped', got %q", connRes.Google.Status)
+	}
+}
+
+func TestDirectDNSCloudflareUDPWithRemoteDNSTCP(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBase := BaseConfig
+	origState := StateFile
+	origRuntime := RuntimeConfig
+	defer func() {
+		BaseConfig = origBase
+		StateFile = origState
+		RuntimeConfig = origRuntime
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	StateFile = filepath.Join(tmpDir, "state.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+
+	baseJSON := `{"inbounds":[{"tag":"tproxy-in","listen":"0.0.0.0","port":12345,"protocol":"dokodemo-door"}],"outbounds":[{"tag":"proxy","protocol":"vless"},{"tag":"direct","protocol":"freedom"}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[]}}`
+	if err := os.WriteFile(BaseConfig, []byte(baseJSON), 0644); err != nil {
+		t.Fatalf("failed to write base config: %v", err)
+	}
+
+	// Direct DNS: 1.1.1.1 (UDP), Remote DNS: tcp://1.1.1.1 (TCP)
+	st := PanelState{
+		ProxyMode:  "rule",
+		ActiveNode: "node1",
+		DNS: DNSConfig{
+			RemoteDNS:     "tcp://1.1.1.1",
+			DirectDNS:     "1.1.1.1",
+			QueryStrategy: "UseIPv4",
+		},
+		Nodes: []NodeProfile{
+			{ID: "node1", Name: "Node1", Protocol: "vless", Address: "proxy.server.com", Port: 443, Outbound: map[string]interface{}{"tag": "proxy", "protocol": "vless"}},
+		},
+	}
+	if err := saveState(st); err != nil {
+		t.Fatalf("saveState failed: %v", err)
+	}
+
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig failed: %v", err)
+	}
+
+	data, err := os.ReadFile(RuntimeConfig)
+	if err != nil {
+		t.Fatalf("read runtime config failed: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal config failed: %v", err)
+	}
+
+	// Verify DNS server ordering: direct DNS is Server 0, remote DNS is Server 1
+	dnsCfg := cfg["dns"].(map[string]interface{})
+	servers := dnsCfg["servers"].([]interface{})
+	server0 := servers[0].(map[string]interface{})
+	if server0["address"] != "1.1.1.1" {
+		t.Errorf("expected Server 0 to be direct DNS 1.1.1.1, got %v", server0["address"])
+	}
+	server1 := servers[1].(map[string]interface{})
+	if server1["address"] != "tcp://1.1.1.1" {
+		t.Errorf("expected Server 1 to be remote DNS tcp://1.1.1.1, got %v", server1["address"])
+	}
+
+	// Verify routing rules: direct rule for 1.1.1.1 specifies network "udp" and port "53"
+	routing := cfg["routing"].(map[string]interface{})
+	rules := routing["rules"].([]interface{})
+	foundDirectUDP53 := false
+	for _, r := range rules {
+		rm := r.(map[string]interface{})
+		if rm["outboundTag"] == "direct" && rm["port"] == "53" {
+			if ips, ok := rm["ip"].([]interface{}); ok && len(ips) == 1 && ips[0] == "1.1.1.1" {
+				if rm["network"] == "udp" {
+					foundDirectUDP53 = true
+				}
+			}
+		}
+	}
+	if !foundDirectUDP53 {
+		t.Errorf("expected direct rule for 1.1.1.1 to match port 53 and network udp to prevent hijacking remote TCP DNS")
+	}
+}
+
+func TestApiModeSwitchAndAutoRestart(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersistState := PersistStateFile
+	defer func() {
+		StateFile = origState
+		PersistStateFile = origPersistState
+	}()
+
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+
+	st := PanelState{
+		ProxyMode: "rule",
+		Nodes:     []NodeProfile{},
+	}
+	_ = saveState(st)
+
+	modeBody := bytes.NewBufferString(`{"proxy_mode":"global"}`)
+	req := httptest.NewRequest("POST", "/api/mode", modeBody)
+	rec := httptest.NewRecorder()
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ProxyMode string `json:"proxy_mode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s := loadState()
+		s.ProxyMode = req.ProxyMode
+		_ = saveState(s)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":    "ok",
+			"mode":      req.ProxyMode,
+			"restarted": false,
+		})
+	}
+
+	handler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	saved := loadState()
+	if saved.ProxyMode != "global" {
+		t.Errorf("expected mode global, got %s", saved.ProxyMode)
 	}
 }

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Allow passing version, versionCode, and xray version via args or env:
 # Usage: ./build.sh [MOD_VERSION] [MOD_VERSION_CODE] [XRAY_VER]
-MOD_VERSION="${1:-${MOD_VERSION:-v1.2.0}}"
+MOD_VERSION="${1:-${MOD_VERSION:-v1.2.2}}"
 MOD_VERSION_CODE="${2:-${MOD_VERSION_CODE:-}}"
 XRAY_VER="${3:-${XRAY_VER:-v26.11.9}}"
 
@@ -64,6 +64,10 @@ fi
 
 cp ".cache/downloads/geoip.dat" "$OUT_DIR/config/geoip.dat"
 cp ".cache/downloads/geosite.dat" "$OUT_DIR/config/geosite.dat"
+cp ".cache/downloads/geoip.dat" "$OUT_DIR/bin/geoip.dat"
+cp ".cache/downloads/geosite.dat" "$OUT_DIR/bin/geosite.dat"
+cp ".cache/downloads/geoip.dat" "$OUT_DIR/geoip.dat"
+cp ".cache/downloads/geosite.dat" "$OUT_DIR/geosite.dat"
 
 # 4. Copy Magisk/KernelSU module scripts and base configuration
 cp -r module/* "$OUT_DIR/"
