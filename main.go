@@ -138,7 +138,7 @@ func directDialer(timeout time.Duration) *net.Dialer {
 		Control: func(network, address string, c syscall.RawConn) error {
 			var sockErr error
 			_ = c.Control(func(fd uintptr) {
-				sockErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, soMarkOpt, BypassMark)
+				sockErr = setSocketMark(fd, BypassMark)
 			})
 			return sockErr
 		},
@@ -544,17 +544,6 @@ func cleanupIptables() {
 		"-p", "udp", "--dport", "443", "-j", "REJECT")
 }
 
-func raiseFileLimits() {
-	for _, limit := range []uint64{1048576, 262144, 65536} {
-		var rLimit syscall.Rlimit
-		rLimit.Max = limit
-		rLimit.Cur = limit
-		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err == nil {
-			return
-		}
-	}
-}
-
 func superviseXray(stopCh <-chan struct{}, doneCh chan<- struct{}) {
 	defer close(doneCh)
 	raiseFileLimits()
@@ -576,12 +565,7 @@ func superviseXray(stopCh <-chan struct{}, doneCh chan<- struct{}) {
 		cmd.Stdout = logSink
 		cmd.Stderr = logSink
 
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{
-				Uid: 0,
-				Gid: XrayGID,
-			},
-		}
+		configureProcessCredentials(cmd, XrayGID)
 
 		if err := cmd.Start(); err != nil {
 			log.Printf("[passwall-droid] xray start error: %v; retrying in 3s", err)
@@ -1573,7 +1557,7 @@ func main() {
 	}
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sigCh, notifySignals...)
 	<-sigCh
 
 	stopProxyEngine()
@@ -1959,3 +1943,4 @@ setInterval(function() {
 </script>
 </body>
 </html>
+`
