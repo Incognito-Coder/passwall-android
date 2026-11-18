@@ -5,21 +5,32 @@
   "dns": {
     "servers": [
       {
-        "address": "1.1.1.1",
-        "port": 53,
-        "domains": ["geosite:geolocation-!cn"]
-      },
-      {
         "address": "223.5.5.5",
         "port": 53,
-        "domains": ["geosite:cn", "domain:ir", "geosite:ir"],
-        "skipFallback": true
+        "domains": [
+          "geosite:cn",
+          "domain:ir",
+          "geosite:ir"
+        ],
+        "skipFallback": false
       },
+      "1.1.1.1",
       "8.8.8.8"
     ],
     "queryStrategy": "UseIPv4"
   },
   "inbounds": [
+    {
+      "tag": "dns-in",
+      "listen": "0.0.0.0",
+      "port": 1053,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "network": "tcp,udp",
+        "address": "1.1.1.1",
+        "port": 53
+      }
+    },
     {
       "tag": "tproxy-in",
       "listen": "0.0.0.0",
@@ -31,7 +42,11 @@
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls", "quic", "fakedns"],
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
         "routeOnly": true
       },
       "streamSettings": {
@@ -51,7 +66,12 @@
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls"]
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "routeOnly": true
       }
     }
   ],
@@ -84,12 +104,11 @@
     {
       "tag": "direct",
       "protocol": "freedom",
-      "settings": {
-        "domainStrategy": "UseIPv4"
-      },
+      "settings": {},
       "streamSettings": {
         "sockopt": {
-          "mark": 33554432
+          "mark": 33554432,
+          "domainStrategy": "UseIPv4"
         }
       }
     },

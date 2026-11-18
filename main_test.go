@@ -1357,3 +1357,750 @@ func TestGetAssetDir(t *testing.T) {
 		t.Errorf("expected %s, got %s", cfgDir, dir)
 	}
 }
+
+func TestDirectDNSPreservesCustomValue(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersistState := PersistStateFile
+	defer func() {
+		StateFile = origState
+		PersistStateFile = origPersistState
+	}()
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist.json")
+
+	st := PanelState{
+		DNS: DNSConfig{
+			DirectDNS: "223.5.5.5",
+			RemoteDNS: "tcp://1.1.1.1",
+		},
+	}
+	if err := saveState(st); err != nil {
+		t.Fatalf("saveState failed: %v", err)
+	}
+
+	loaded := loadState()
+	if loaded.DNS.DirectDNS != "223.5.5.5" {
+		t.Errorf("expected DirectDNS to remain 223.5.5.5, got %q", loaded.DNS.DirectDNS)
+	}
+
+	st.DNS.DirectDNS = "10.202.10.202"
+	if err := saveState(st); err != nil {
+		t.Fatalf("saveState failed: %v", err)
+	}
+	loaded = loadState()
+	if loaded.DNS.DirectDNS != "10.202.10.202" {
+		t.Errorf("expected DirectDNS to remain 10.202.10.202, got %q", loaded.DNS.DirectDNS)
+	}
+}
+
+func TestActiveNodeAutoSelectionOnBoot(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersistState := PersistStateFile
+	defer func() {
+		StateFile = origState
+		PersistStateFile = origPersistState
+	}()
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist.json")
+
+	// State with nodes but empty ActiveNode
+	st := PanelState{
+		ActiveNode: "",
+		Nodes: []NodeProfile{
+			{ID: "node-first", Name: "First Node", Protocol: "vless"},
+			{ID: "node-second", Name: "Second Node", Protocol: "vless"},
+		},
+	}
+	data, _ := json.Marshal(st)
+	_ = os.WriteFile(StateFile, data, 0644)
+	_ = os.WriteFile(PersistStateFile, data, 0644)
+
+	loaded := loadState()
+	if loaded.ActiveNode != "node-first" {
+		t.Errorf("expected ActiveNode to auto-fallback to first node 'node-first', got %q", loaded.ActiveNode)
+	}
+
+	// State with ActiveNode pointing to non-existent node
+	st.ActiveNode = "non-existent-id"
+	data, _ = json.Marshal(st)
+	_ = os.WriteFile(StateFile, data, 0644)
+	_ = os.WriteFile(PersistStateFile, data, 0644)
+
+	loaded = loadState()
+	if loaded.ActiveNode != "node-first" {
+		t.Errorf("expected ActiveNode pointing to invalid ID to fallback to 'node-first', got %q", loaded.ActiveNode)
+	}
+}
+
+func TestInboundSniffingConfigured(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBase := BaseConfig
+	origState := StateFile
+	origRuntime := RuntimeConfig
+	defer func() {
+		BaseConfig = origBase
+		StateFile = origState
+		RuntimeConfig = origRuntime
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	StateFile = filepath.Join(tmpDir, "state.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+
+	// Base config with no sniffing on inbounds
+	baseJSON := `{"inbounds":[{"tag":"tproxy-in","listen":"0.0.0.0","port":12345,"protocol":"dokodemo-door"}],"outbounds":[{"tag":"proxy","protocol":"vless"},{"tag":"direct","protocol":"freedom"}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[]}}`
+	if err := os.WriteFile(BaseConfig, []byte(baseJSON), 0644); err != nil {
+		t.Fatalf("failed to write base config: %v", err)
+	}
+
+	st := PanelState{
+		ProxyMode:  "rule",
+		ActiveNode: "node1",
+		Nodes: []NodeProfile{
+			{ID: "node1", Name: "Node1", Protocol: "vless", Address: "1.2.3.4", Port: 443, Outbound: map[string]interface{}{"tag": "proxy", "protocol": "vless"}},
+		},
+	}
+	_ = saveState(st)
+
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig failed: %v", err)
+	}
+
+	data, err := os.ReadFile(RuntimeConfig)
+	if err != nil {
+		t.Fatalf("read runtime config failed: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal config failed: %v", err)
+	}
+
+	inbounds := cfg["inbounds"].([]interface{})
+	var tproxyIn, socksIn map[string]interface{}
+	for _, inb := range inbounds {
+		m := inb.(map[string]interface{})
+		if m["tag"] == "tproxy-in" {
+			tproxyIn = m
+		}
+		if m["tag"] == "socks-in" {
+			socksIn = m
+		}
+	}
+
+	if tproxyIn == nil {
+		t.Fatalf("expected tproxy-in inbound")
+	}
+	sniffT, ok := tproxyIn["sniffing"].(map[string]interface{})
+	if !ok || sniffT["enabled"] != true {
+		t.Errorf("expected sniffing enabled on tproxy-in, got %v", sniffT)
+	}
+	if sniffT["routeOnly"] != true {
+		t.Errorf("expected routeOnly: true on tproxy-in sniffing")
+	}
+
+	if socksIn == nil {
+		t.Fatalf("expected socks-in inbound")
+	}
+	sniffS, ok := socksIn["sniffing"].(map[string]interface{})
+	if !ok || sniffS["enabled"] != true {
+		t.Errorf("expected sniffing enabled on socks-in, got %v", sniffS)
+	}
+
+	// Verify DNS server skipFallback is false
+	dnsCfg := cfg["dns"].(map[string]interface{})
+	servers := dnsCfg["servers"].([]interface{})
+	server0 := servers[0].(map[string]interface{})
+	if server0["skipFallback"] == true {
+		t.Errorf("expected skipFallback to be false for direct DNS server")
+	}
+
+	// Verify domainStrategy is IPIfNonMatch
+	routing := cfg["routing"].(map[string]interface{})
+	if routing["domainStrategy"] != "IPIfNonMatch" {
+		t.Errorf("expected domainStrategy IPIfNonMatch, got %v", routing["domainStrategy"])
+	}
+}
+
+func TestWebListenAddrIsAllInterfaces(t *testing.T) {
+	if WebListenAddr != "0.0.0.0:9090" {
+		t.Errorf("expected WebListenAddr to be 0.0.0.0:9090, got %q", WebListenAddr)
+	}
+}
+
+func TestCSSVerticalCenteringStyles(t *testing.T) {
+	if !strings.Contains(dashboardHTML, "line-height:1") {
+		t.Errorf("expected line-height:1 in dashboardHTML")
+	}
+	if !strings.Contains(dashboardHTML, "appearance:none;-webkit-appearance:none") {
+		t.Errorf("expected appearance:none in dashboardHTML")
+	}
+	if !strings.Contains(dashboardHTML, ".btn-sm") {
+		t.Errorf("expected .btn-sm class in dashboardHTML")
+	}
+}
+
+func TestFreedomDomainStrategyMigration(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBase := BaseConfig
+	origState := StateFile
+	origRuntime := RuntimeConfig
+	defer func() {
+		BaseConfig = origBase
+		StateFile = origState
+		RuntimeConfig = origRuntime
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	StateFile = filepath.Join(tmpDir, "state.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+
+	// Legacy base config with deprecated settings.domainStrategy in freedom outbound
+	baseJSON := `{
+		"inbounds": [{"tag":"tproxy-in","listen":"0.0.0.0","port":12345,"protocol":"dokodemo-door"}],
+		"outbounds": [
+			{"tag":"proxy","protocol":"vless"},
+			{
+				"tag":"direct",
+				"protocol":"freedom",
+				"settings":{
+					"domainStrategy":"UseIPv4"
+				}
+			}
+		],
+		"routing": {"domainStrategy":"IPIfNonMatch","rules":[]}
+	}`
+	if err := os.WriteFile(BaseConfig, []byte(baseJSON), 0644); err != nil {
+		t.Fatalf("failed to write base config: %v", err)
+	}
+
+	st := PanelState{
+		ProxyMode:  "rule",
+		ActiveNode: "node1",
+		Nodes: []NodeProfile{
+			{ID: "node1", Name: "Node1", Protocol: "vless", Address: "1.2.3.4", Port: 443, Outbound: map[string]interface{}{"tag": "proxy", "protocol": "vless"}},
+		},
+	}
+	_ = saveState(st)
+
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig failed: %v", err)
+	}
+
+	data, err := os.ReadFile(RuntimeConfig)
+	if err != nil {
+		t.Fatalf("read runtime config failed: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal config failed: %v", err)
+	}
+
+	outbounds := cfg["outbounds"].([]interface{})
+	var directOb map[string]interface{}
+	for _, ob := range outbounds {
+		m := ob.(map[string]interface{})
+		if m["tag"] == "direct" {
+			directOb = m
+			break
+		}
+	}
+	if directOb == nil {
+		t.Fatalf("expected direct outbound in config")
+	}
+
+	// 1. Deprecated domainStrategy in settings MUST be removed
+	if settings, ok := directOb["settings"].(map[string]interface{}); ok {
+		if _, exists := settings["domainStrategy"]; exists {
+			t.Errorf("deprecated freedom.domainStrategy should have been removed from settings, but was found: %v", settings["domainStrategy"])
+		}
+	}
+
+	// 2. domainStrategy MUST be present in streamSettings.sockopt
+	ss, ok := directOb["streamSettings"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected streamSettings in direct outbound")
+	}
+	sockopt, ok := ss["sockopt"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected sockopt in streamSettings")
+	}
+	if sockopt["domainStrategy"] != "UseIPv4" {
+		t.Errorf("expected sockopt.domainStrategy to be 'UseIPv4', got %v", sockopt["domainStrategy"])
+	}
+}
+
+func TestDefaultBaseConfigJSONValid(t *testing.T) {
+	var cfg map[string]interface{}
+	if err := json.Unmarshal([]byte(DefaultBaseConfigJSON), &cfg); err != nil {
+		t.Fatalf("DefaultBaseConfigJSON is not valid JSON: %v", err)
+	}
+
+	// Verify freedom outbound has sockopt.domainStrategy
+	outbounds, ok := cfg["outbounds"].([]interface{})
+	if !ok {
+		t.Fatalf("outbounds not found in default config")
+	}
+	var directOb map[string]interface{}
+	for _, ob := range outbounds {
+		m := ob.(map[string]interface{})
+		if m["tag"] == "direct" {
+			directOb = m
+			break
+		}
+	}
+	if directOb == nil {
+		t.Fatalf("direct outbound not found")
+	}
+	if settings, ok := directOb["settings"].(map[string]interface{}); ok {
+		if _, exists := settings["domainStrategy"]; exists {
+			t.Errorf("DefaultBaseConfigJSON has deprecated freedom.domainStrategy in settings")
+		}
+	}
+}
+
+func TestResetBaseConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBase := BaseConfig
+	origPersistBase := PersistBaseConfig
+	origState := StateFile
+	origPersistState := PersistStateFile
+	origPersistDir := PersistDir
+	defer func() {
+		BaseConfig = origBase
+		PersistBaseConfig = origPersistBase
+		StateFile = origState
+		PersistStateFile = origPersistState
+		PersistDir = origPersistDir
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	PersistDir = filepath.Join(tmpDir, "persist")
+	PersistBaseConfig = filepath.Join(PersistDir, "config.json")
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(PersistDir, "state.json")
+
+	// Corrupt or write customized config.json and active state
+	_ = os.WriteFile(BaseConfig, []byte(`{"custom":"bad-config"}`), 0644)
+	st := PanelState{ActiveNode: "node-123"}
+	_ = saveState(st)
+
+	if err := resetBaseConfig(); err != nil {
+		t.Fatalf("resetBaseConfig failed: %v", err)
+	}
+
+	// Verify BaseConfig was restored
+	baseData, err := os.ReadFile(BaseConfig)
+	if err != nil {
+		t.Fatalf("read BaseConfig failed: %v", err)
+	}
+	var testObj map[string]interface{}
+	if err := json.Unmarshal(baseData, &testObj); err != nil {
+		t.Fatalf("restored config is invalid JSON: %v", err)
+	}
+	if _, ok := testObj["inbounds"]; !ok {
+		t.Errorf("restored config missing inbounds")
+	}
+
+	// Verify PersistBaseConfig was restored
+	persistData, err := os.ReadFile(PersistBaseConfig)
+	if err != nil {
+		t.Fatalf("read PersistBaseConfig failed: %v", err)
+	}
+	if string(persistData) != string(baseData) {
+		t.Errorf("PersistBaseConfig does not match BaseConfig")
+	}
+
+	// Verify active node was cleared
+	loadedSt := loadState()
+	if loadedSt.ActiveNode != "" {
+		t.Errorf("expected ActiveNode to be reset to empty, got %q", loadedSt.ActiveNode)
+	}
+}
+
+func TestApiConfigReset(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBase := BaseConfig
+	origPersistBase := PersistBaseConfig
+	origState := StateFile
+	origPersistState := PersistStateFile
+	origPersistDir := PersistDir
+	defer func() {
+		BaseConfig = origBase
+		PersistBaseConfig = origPersistBase
+		StateFile = origState
+		PersistStateFile = origPersistState
+		PersistDir = origPersistDir
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	PersistDir = filepath.Join(tmpDir, "persist")
+	PersistBaseConfig = filepath.Join(PersistDir, "config.json")
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(PersistDir, "state.json")
+
+	// Corrupt BaseConfig first
+	_ = os.WriteFile(BaseConfig, []byte(`{"corrupted":true}`), 0644)
+	_ = saveState(PanelState{ActiveNode: "old-node"})
+
+	// Test 1: POST /api/config with {"action":"reset"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var req struct {
+				Action  string `json:"action"`
+				RawJSON string `json:"raw_json"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Action == "reset" {
+				if err := resetBaseConfig(); err != nil {
+					http.Error(w, err.Error(), 500)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+				return
+			}
+		}
+	})
+	mux.HandleFunc("/api/config/reset", func(w http.ResponseWriter, r *http.Request) {
+		if err := resetBaseConfig(); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(`{"action":"reset"}`))
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/config action:reset, got %d", rec.Code)
+	}
+
+	data, _ := os.ReadFile(BaseConfig)
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil || cfg["inbounds"] == nil {
+		t.Fatalf("BaseConfig was not reset properly: %s", string(data))
+	}
+
+	// Test 2: POST /api/config/reset
+	_ = os.WriteFile(BaseConfig, []byte(`{"custom":123}`), 0644)
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/api/config/reset", nil)
+	mux.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/config/reset, got %d", rec2.Code)
+	}
+	data2, _ := os.ReadFile(BaseConfig)
+	if strings.Contains(string(data2), `"custom"`) {
+		t.Errorf("expected config to be reset, but still contains custom")
+	}
+}
+
+func TestPrepareRuntimeConfigPreservesUserRules(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBase := BaseConfig
+	origState := StateFile
+	origRuntime := RuntimeConfig
+	defer func() {
+		BaseConfig = origBase
+		StateFile = origState
+		RuntimeConfig = origRuntime
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	StateFile = filepath.Join(tmpDir, "state.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+
+	// Base config with a custom domain routing rule
+	customBase := `{
+		"inbounds": [{"tag": "tproxy-in", "listen": "0.0.0.0", "port": 12345, "protocol": "dokodemo-door"}],
+		"outbounds": [{"tag": "proxy", "protocol": "vless"}, {"tag": "direct", "protocol": "freedom"}],
+		"routing": {
+			"domainStrategy": "IPIfNonMatch",
+			"rules": [
+				{
+					"type": "field",
+					"domain": ["customdomain.example.com"],
+					"outboundTag": "proxy"
+				}
+			]
+		}
+	}`
+	if err := os.WriteFile(BaseConfig, []byte(customBase), 0644); err != nil {
+		t.Fatalf("failed to write BaseConfig: %v", err)
+	}
+
+	st := PanelState{
+		ProxyMode:  "rule",
+		ActiveNode: "node1",
+		Nodes: []NodeProfile{
+			{ID: "node1", Name: "Node1", Protocol: "vless", Address: "1.2.3.4", Port: 443, Outbound: map[string]interface{}{"tag": "proxy", "protocol": "vless"}},
+		},
+	}
+	_ = saveState(st)
+
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig failed: %v", err)
+	}
+
+	data, err := os.ReadFile(RuntimeConfig)
+	if err != nil {
+		t.Fatalf("read runtime config failed: %v", err)
+	}
+
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal runtime config failed: %v", err)
+	}
+
+	routing, ok := cfg["routing"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("routing object missing in runtime config")
+	}
+	rules, ok := routing["rules"].([]interface{})
+	if !ok {
+		t.Fatalf("rules array missing in runtime config")
+	}
+
+	foundCustom := false
+	for _, r := range rules {
+		rMap := r.(map[string]interface{})
+		if domains, ok := rMap["domain"].([]interface{}); ok {
+			for _, d := range domains {
+				if d == "customdomain.example.com" {
+					foundCustom = true
+					if rMap["outboundTag"] != "proxy" {
+						t.Errorf("expected outboundTag 'proxy' for custom domain rule, got %v", rMap["outboundTag"])
+					}
+					break
+				}
+			}
+		}
+	}
+
+	if !foundCustom {
+		t.Errorf("custom user domain routing rule was not preserved in runtime config")
+	}
+}
+
+func TestWebUIConfigResetButton(t *testing.T) {
+	if !strings.Contains(dashboardHTML, `onclick="resetConfig()"`) {
+		t.Errorf("expected Reset to Default button in dashboardHTML")
+	}
+	if !strings.Contains(dashboardHTML, `function resetConfig()`) {
+		t.Errorf("expected resetConfig() function in dashboardHTML")
+	}
+	if !strings.Contains(dashboardHTML, `/api/config/reset`) {
+		t.Errorf("expected /api/config/reset call in dashboardHTML")
+	}
+}
+
+func TestCheckGeositeTags(t *testing.T) {
+	geositePath := "dist/passwall-android/bin/geosite.dat"
+	data, err := os.ReadFile(geositePath)
+	if err != nil {
+		t.Skip("geosite.dat not present in dist")
+	}
+	
+	foundTags := map[string]bool{}
+	for i := 0; i < len(data)-10; i++ {
+		if data[i] == 0x0a {
+			l := int(data[i+1])
+			if l > 0 && l < 30 && i+2+l <= len(data) {
+				tag := string(data[i+2 : i+2+l])
+				isAlphanum := true
+				for _, c := range tag {
+					if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '@') {
+						isAlphanum = false
+						break
+					}
+				}
+				if isAlphanum && len(tag) >= 2 {
+					foundTags[strings.ToLower(tag)] = true
+				}
+			}
+		}
+	}
+	for tag := range foundTags {
+		if strings.Contains(tag, "ir") || strings.Contains(tag, "ad") || strings.Contains(tag, "geo") || tag == "cn" {
+			t.Logf("Relevant Geosite Tag: %s", tag)
+		}
+	}
+}
+
+func TestGoogleComRoutingAndDNSResolution(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "passwall-google-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	oldBase := BaseConfig
+	oldPersistBase := PersistBaseConfig
+	oldState := StateFile
+	oldPersistState := PersistStateFile
+	oldRuntime := RuntimeConfig
+	defer func() {
+		BaseConfig = oldBase
+		PersistBaseConfig = oldPersistBase
+		StateFile = oldState
+		PersistStateFile = oldPersistState
+		RuntimeConfig = oldRuntime
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	PersistBaseConfig = filepath.Join(tmpDir, "persist_config.json")
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+
+	if err := resetBaseConfig(); err != nil {
+		t.Fatalf("resetBaseConfig failed: %v", err)
+	}
+
+	st := PanelState{
+		ProxyMode:  "rule",
+		ActiveNode: "node-google-test",
+		DNS: DNSConfig{
+			RemoteDNS:     "tcp://1.1.1.1",
+			DirectDNS:     "223.5.5.5",
+			QueryStrategy: "UseIPv4",
+		},
+		Nodes: []NodeProfile{
+			{
+				ID:       "node-google-test",
+				Name:     "Fast Node",
+				Protocol: "vless",
+				Address:  "my-proxy.com",
+				Port:     443,
+				Outbound: map[string]interface{}{
+					"tag":      "proxy",
+					"protocol": "vless",
+					"settings": map[string]interface{}{},
+				},
+			},
+		},
+	}
+	if err := saveState(st); err != nil {
+		t.Fatalf("saveState failed: %v", err)
+	}
+
+	// Test TPROXY mode
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig(tproxy) failed: %v", err)
+	}
+
+	data, err := os.ReadFile(RuntimeConfig)
+	if err != nil {
+		t.Fatalf("read runtime config failed: %v", err)
+	}
+
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal runtime config failed: %v", err)
+	}
+
+	// 1. Check DNS servers
+	dnsCfg := cfg["dns"].(map[string]interface{})
+	servers := dnsCfg["servers"].([]interface{})
+	if len(servers) < 2 {
+		t.Fatalf("expected at least 2 dns servers, got %d", len(servers))
+	}
+
+	// Verify no geosite:geolocation-!cn exists anywhere in DNS servers
+	for i, s := range servers {
+		if sMap, ok := s.(map[string]interface{}); ok {
+			if doms, ok := sMap["domains"].([]interface{}); ok {
+				for _, d := range doms {
+					if d == "geosite:geolocation-!cn" {
+						t.Fatalf("DNS server %d contains fatal tag geosite:geolocation-!cn", i)
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Check dedicated dns-in inbound
+	inbounds := cfg["inbounds"].([]interface{})
+	hasDNSIn := false
+	for _, inb := range inbounds {
+		m := inb.(map[string]interface{})
+		if m["tag"] == "dns-in" {
+			hasDNSIn = true
+			if m["port"].(float64) != 1053 {
+				t.Errorf("expected dns-in port 1053, got %v", m["port"])
+			}
+			break
+		}
+	}
+	if !hasDNSIn {
+		t.Fatalf("dns-in inbound not found in inbounds")
+	}
+
+	// 3. Check routing rules
+	routing := cfg["routing"].(map[string]interface{})
+	rules := routing["rules"].([]interface{})
+
+	hasDNSInRouting := false
+	hasDirectDomestic := false
+	hasFallbackProxy := false
+
+	for _, r := range rules {
+		rm := r.(map[string]interface{})
+		// Check dns-in rule
+		if inTags, ok := rm["inboundTag"].([]interface{}); ok {
+			for _, tag := range inTags {
+				if tag == "dns-in" && rm["outboundTag"] == "dns-out" {
+					hasDNSInRouting = true
+				}
+			}
+		}
+		// Check direct domestic rule
+		if doms, ok := rm["domain"].([]interface{}); ok {
+			for _, d := range doms {
+				if d == "domain:ir" || d == "geosite:ir" {
+					if rm["outboundTag"] == "direct" {
+						hasDirectDomestic = true
+					}
+				}
+			}
+		}
+		// Check fallthrough defaultOutbound rule
+		if rm["network"] == "tcp,udp" && rm["outboundTag"] == "proxy" {
+			hasFallbackProxy = true
+		}
+	}
+
+	if !hasDNSInRouting {
+		t.Errorf("dns-in routing rule to dns-out not found")
+	}
+	if !hasDirectDomestic {
+		t.Errorf("domestic routing rule to direct outbound not found")
+	}
+	if !hasFallbackProxy {
+		t.Errorf("fallthrough rule routing to proxy outbound (for google.com) not found")
+	}
+
+	// 4. Test when no nodes are imported or mode is direct: fallback must safely be direct
+	st.Nodes = nil
+	st.ActiveNode = ""
+	_ = saveState(st)
+	if err := prepareRuntimeConfig(false); err != nil {
+		t.Fatalf("prepareRuntimeConfig(redirect without nodes) failed: %v", err)
+	}
+
+	dataNoNode, _ := os.ReadFile(RuntimeConfig)
+	var cfgNoNode map[string]interface{}
+	_ = json.Unmarshal(dataNoNode, &cfgNoNode)
+
+	routingNoNode := cfgNoNode["routing"].(map[string]interface{})
+	rulesNoNode := routingNoNode["rules"].([]interface{})
+	lastRule := rulesNoNode[len(rulesNoNode)-1].(map[string]interface{})
+	if lastRule["outboundTag"] != "direct" {
+		t.Errorf("expected fallthrough outbound to be direct when no nodes are imported, got %v", lastRule["outboundTag"])
+	}
+}

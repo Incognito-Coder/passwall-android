@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Allow passing version, versionCode, and xray version via args or env:
 # Usage: ./build.sh [MOD_VERSION] [MOD_VERSION_CODE] [XRAY_VER]
-MOD_VERSION="${1:-${MOD_VERSION:-v1.2.3}}"
+MOD_VERSION="${1:-${MOD_VERSION:-v1.2.4}}"
 MOD_VERSION_CODE="${2:-${MOD_VERSION_CODE:-}}"
 XRAY_VER="${3:-${XRAY_VER:-v26.11.9}}"
 

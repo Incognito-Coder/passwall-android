@@ -75,4 +75,4 @@ set_perm "$MODPATH/bin/passwall-droid" 0 0 0755
 set_perm "$MODPATH/bin/xray" 0 0 0755
 set_perm "$MODPATH/system/bin/passwall" 0 0 0755
 
-ui_print "- Web Control Panel: http://127.0.0.1:9090"
+ui_print "- Web Control Panel: http://127.0.0.1:9090 (or http://<device-ip>:9090)"

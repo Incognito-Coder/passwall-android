@@ -10,8 +10,9 @@ OpenWrt Passwall-style transparent proxy module for Android 6.0 through Android 
 - **System-Wide & Hotspot/NAT Transparent Proxy:** Captures local apps (`OUTPUT`) and Wi-Fi hotspot / USB tethering clients (`PREROUTING`) across all interfaces (`wlan0`, `ap0`, `swlan0`, `rndis0`). Features multi-interface `rp_filter=0` mitigation, `route_localnet=1`, tethering NAT masquerading, and forward chain acceptance so connected devices never get "no internet".
 - **Android 6.0+ & ARMv7 Compatibility:** Automatically detects kernel `xt_TPROXY` support at startup and falls back to `nat REDIRECT` on legacy Android 6 vendor kernels, with `GOGC=40` and `GOMEMLIMIT=48MiB` memory tuning.
 - **Android 12+ eBPF & Hardware Tethering Offload Bypass & Netd Watchdog:** Disables tether hardware offload (`settings put global tether_offload_disabled 1`, `cmd connectivity tether offload set false`, and `ndc`) so hotspot traffic traverses Netfilter, and dynamically restores routing rules and sysctls if Android resets tables during network switches.
-- **Zero-Loss Config & UI State Upgrades:** Automatically preserves base Xray configuration (`config.json`) and UI state (`state.json` - saved nodes, subscriptions, active node, DNS settings, and per-app split tunnel UIDs) across Magisk and KernelSU module ZIP updates via persistent storage (`/data/adb/passwall/`).
-- **Embedded Web Control Panel (`http://127.0.0.1:9090`):**
+- **Zero-Loss Config & UI State Upgrades & Factory Reset:** Automatically preserves base Xray configuration (`config.json`) and UI state (`state.json` - saved nodes, subscriptions, active node, DNS settings, and per-app split tunnel UIDs) across Magisk and KernelSU module ZIP updates via persistent storage (`/data/adb/passwall/`). Includes one-click **Reset to Default** in the Web UI and CLI (`passwall reset-config`).
+- **Domain-Aware Routing & Leak Prevention:** Bridges Layer 3/4 Netfilter IP packets to Layer 7 domain routing using UDP/TCP port 53 DNS interception and TLS/HTTP/QUIC SNI sniffing (`sniffing.destOverride = ["http", "tls", "quic"]`). Rejects Android Private DNS (DoT port 853) to prevent leaks, blocks IPv6 via kernel sysctls and `ip6tables` drop rules, blocks QUIC (UDP 443) to force standard TLS SNI sniffing, and preserves custom user routing rules.
+- **Embedded Web Control Panel (`http://127.0.0.1:9090` or `http://<phone-ip>:9090` on LAN):**
   - Switch routing modes (`Rule`, `Global`, `Direct`) with deadlock-free domain resolution for proxy nodes.
   - Dedicated **DNS Settings** tab: configure Remote DNS (`tcp://1.1.1.1`, `https://dns.google/dns-query`, etc.), Direct DNS (`223.5.5.5`, `10.202.10.202`, etc.), and Query Strategy (`UseIPv4`, `UseIP`, `UseIPv6`).
   - Import `vless://` (including `xhttp`, `ws`, `grpc`, `tls`, `reality`), `trojan://`, `vmess://`, `ss://`, and `hysteria2://` / `hy2://` links.
@@ -42,6 +43,7 @@ When pushing a Git tag (e.g. `git tag v1.2.1 && git push origin v1.2.1`), the Gi
 su -c passwall status
 su -c passwall stop
 su -c passwall start
+su -c passwall reset-config
 ```
 
 ## Author

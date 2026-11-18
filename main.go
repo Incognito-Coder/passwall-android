@@ -34,8 +34,8 @@ var (
 	LogFile       = "/data/adb/passwall-android.log"
 	PidFile       = "/dev/passwall-droid.pid"
 	PackagesFile  = "/data/system/packages.list"
-	WebListenAddr = "127.0.0.1:9090"
-	AppVersion    = "v1.2.3"
+	WebListenAddr = "0.0.0.0:9090"
+	AppVersion    = "v1.2.4"
 
 	PersistDir        = "/data/adb/passwall"
 	PersistBaseConfig = PersistDir + "/config.json"
@@ -56,6 +56,135 @@ const (
 	DisableIPv6 = true
 	MaxLogBytes = 512 * 1024
 )
+
+const DefaultBaseConfigJSON = `{
+  "log": {
+    "loglevel": "warning"
+  },
+  "dns": {
+    "servers": [
+      {
+        "address": "223.5.5.5",
+        "port": 53,
+        "domains": [
+          "geosite:cn",
+          "domain:ir",
+          "geosite:ir"
+        ],
+        "skipFallback": false
+      },
+      "1.1.1.1",
+      "8.8.8.8"
+    ],
+    "queryStrategy": "UseIPv4"
+  },
+  "inbounds": [
+    {
+      "tag": "dns-in",
+      "listen": "0.0.0.0",
+      "port": 1053,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "network": "tcp,udp",
+        "address": "1.1.1.1",
+        "port": 53
+      }
+    },
+    {
+      "tag": "tproxy-in",
+      "listen": "0.0.0.0",
+      "port": 12345,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "network": "tcp,udp",
+        "followRedirect": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "routeOnly": true
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tproxy": "tproxy"
+        }
+      }
+    },
+    {
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ],
+        "routeOnly": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "YOUR_SERVER_DOMAIN_OR_IP",
+            "port": 443,
+            "users": [
+              {
+                "id": "YOUR-UUID-HERE",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "YOUR_SERVER_DOMAIN"
+        }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {},
+      "streamSettings": {
+        "sockopt": {
+          "mark": 33554432,
+          "domainStrategy": "UseIPv4"
+        }
+      }
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    },
+    {
+      "tag": "dns-out",
+      "protocol": "dns"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": []
+  }
+}`
 
 var bypassCIDRsV4 = []string{
 	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
@@ -261,29 +390,93 @@ func detectTproxy() bool {
 		"-p", "tcp", "-j", "TPROXY", "--on-port", strconv.Itoa(TproxyPort), "--on-ip", "127.0.0.1") == nil
 }
 
+func writeSyncedFile(path string, data []byte) error {
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
 func syncPersistentConfigs() {
 	_ = os.MkdirAll(PersistDir, 0755)
 	_ = os.MkdirAll(filepath.Dir(BaseConfig), 0755)
 
-	if _, err := os.Stat(BaseConfig); os.IsNotExist(err) {
-		if data, errRead := os.ReadFile(PersistBaseConfig); errRead == nil && len(data) > 0 {
-			_ = os.WriteFile(BaseConfig, data, 0644)
+	// Sync BaseConfig and PersistBaseConfig
+	statBase, errBase := os.Stat(BaseConfig)
+	statPersistBase, errPersistBase := os.Stat(PersistBaseConfig)
+	if errBase != nil && errPersistBase == nil {
+		if data, err := os.ReadFile(PersistBaseConfig); err == nil && len(data) > 0 {
+			_ = writeSyncedFile(BaseConfig, data)
 		}
-	} else if _, err := os.Stat(PersistBaseConfig); os.IsNotExist(err) {
-		if data, errRead := os.ReadFile(BaseConfig); errRead == nil && len(data) > 0 {
-			_ = os.WriteFile(PersistBaseConfig, data, 0644)
+	} else if errBase == nil && errPersistBase != nil {
+		if data, err := os.ReadFile(BaseConfig); err == nil && len(data) > 0 {
+			_ = writeSyncedFile(PersistBaseConfig, data)
+		}
+	} else if errBase == nil && errPersistBase == nil {
+		if statPersistBase.ModTime().After(statBase.ModTime()) {
+			if data, err := os.ReadFile(PersistBaseConfig); err == nil && len(data) > 0 {
+				_ = writeSyncedFile(BaseConfig, data)
+			}
+		} else if statBase.ModTime().After(statPersistBase.ModTime()) {
+			if data, err := os.ReadFile(BaseConfig); err == nil && len(data) > 0 {
+				_ = writeSyncedFile(PersistBaseConfig, data)
+			}
 		}
 	}
 
-	if _, err := os.Stat(StateFile); os.IsNotExist(err) {
-		if data, errRead := os.ReadFile(PersistStateFile); errRead == nil && len(data) > 0 {
-			_ = os.WriteFile(StateFile, data, 0644)
+	// Sync StateFile and PersistStateFile
+	statState, errState := os.Stat(StateFile)
+	statPersistState, errPersistState := os.Stat(PersistStateFile)
+	if errState != nil && errPersistState == nil {
+		if data, err := os.ReadFile(PersistStateFile); err == nil && len(data) > 0 {
+			_ = writeSyncedFile(StateFile, data)
 		}
-	} else if _, err := os.Stat(PersistStateFile); os.IsNotExist(err) {
-		if data, errRead := os.ReadFile(StateFile); errRead == nil && len(data) > 0 {
-			_ = os.WriteFile(PersistStateFile, data, 0644)
+	} else if errState == nil && errPersistState != nil {
+		if data, err := os.ReadFile(StateFile); err == nil && len(data) > 0 {
+			_ = writeSyncedFile(PersistStateFile, data)
+		}
+	} else if errState == nil && errPersistState == nil {
+		var stState, stPersist PanelState
+		dataState, _ := os.ReadFile(StateFile)
+		dataPersist, _ := os.ReadFile(PersistStateFile)
+		_ = json.Unmarshal(dataState, &stState)
+		_ = json.Unmarshal(dataPersist, &stPersist)
+
+		if len(stPersist.Nodes) > 0 && len(stState.Nodes) == 0 {
+			_ = writeSyncedFile(StateFile, dataPersist)
+		} else if len(stState.Nodes) > 0 && len(stPersist.Nodes) == 0 {
+			_ = writeSyncedFile(PersistStateFile, dataState)
+		} else if statPersistState.ModTime().After(statState.ModTime()) {
+			_ = writeSyncedFile(StateFile, dataPersist)
+		} else if statState.ModTime().After(statPersistState.ModTime()) {
+			_ = writeSyncedFile(PersistStateFile, dataState)
 		}
 	}
+}
+
+func resetBaseConfig() error {
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, []byte(DefaultBaseConfigJSON), "", "  "); err != nil {
+		return err
+	}
+	_ = os.MkdirAll(filepath.Dir(BaseConfig), 0755)
+	if err := writeSyncedFile(BaseConfig, pretty.Bytes()); err != nil {
+		return err
+	}
+	if errDir := os.MkdirAll(PersistDir, 0755); errDir == nil {
+		_ = writeSyncedFile(PersistBaseConfig, pretty.Bytes())
+	}
+	st := loadState()
+	st.ActiveNode = ""
+	_ = saveState(st)
+	log.Println("[passwall-droid] base config.json reset to factory default")
+	return nil
 }
 
 func loadState() PanelState {
@@ -297,21 +490,44 @@ func loadState() PanelState {
 		SelectedUIDs:   []int{},
 		Nodes:          []NodeProfile{},
 	}
-	loaded := false
+	var stFromState, stFromPersist PanelState
+	hasState := false
+	hasPersist := false
+
 	if data, err := os.ReadFile(StateFile); err == nil && len(data) > 0 {
-		if err := json.Unmarshal(data, &st); err == nil {
-			loaded = true
+		if err := json.Unmarshal(data, &stFromState); err == nil {
+			hasState = true
 		}
 	}
-	if !loaded {
-		if data, err := os.ReadFile(PersistStateFile); err == nil && len(data) > 0 {
-			if err := json.Unmarshal(data, &st); err == nil {
-				loaded = true
-				_ = os.MkdirAll(filepath.Dir(StateFile), 0755)
-				_ = os.WriteFile(StateFile, data, 0644)
+	if data, err := os.ReadFile(PersistStateFile); err == nil && len(data) > 0 {
+		if err := json.Unmarshal(data, &stFromPersist); err == nil {
+			hasPersist = true
+		}
+	}
+
+	if hasState && hasPersist {
+		if len(stFromPersist.Nodes) > 0 && len(stFromState.Nodes) == 0 {
+			st = stFromPersist
+		} else if len(stFromState.Nodes) > 0 && len(stFromPersist.Nodes) == 0 {
+			st = stFromState
+		} else {
+			statState, err1 := os.Stat(StateFile)
+			statPersist, err2 := os.Stat(PersistStateFile)
+			if err1 == nil && err2 == nil && statPersist.ModTime().After(statState.ModTime()) {
+				st = stFromPersist
+			} else {
+				st = stFromState
 			}
 		}
+	} else if hasState {
+		st = stFromState
+	} else if hasPersist {
+		st = stFromPersist
+		if data, err := os.ReadFile(PersistStateFile); err == nil && len(data) > 0 {
+			_ = writeSyncedFile(StateFile, data)
+		}
 	}
+
 	if st.ProxyMode != "rule" && st.ProxyMode != "global" && st.ProxyMode != "direct" {
 		st.ProxyMode = "rule"
 	}
@@ -324,10 +540,29 @@ func loadState() PanelState {
 	if st.Nodes == nil {
 		st.Nodes = []NodeProfile{}
 	}
+
+	// Validate ActiveNode: ensure active node exists in nodes list, or fallback to first node
+	activeExists := false
+	if st.ActiveNode != "" {
+		for _, n := range st.Nodes {
+			if n.ID == st.ActiveNode {
+				activeExists = true
+				break
+			}
+		}
+	}
+	if !activeExists && len(st.Nodes) > 0 {
+		st.ActiveNode = st.Nodes[0].ID
+		if data, err := json.MarshalIndent(st, "", "  "); err == nil {
+			_ = writeSyncedFile(StateFile, data)
+			_ = writeSyncedFile(PersistStateFile, data)
+		}
+	}
+
 	if st.DNS.RemoteDNS == "" {
 		st.DNS.RemoteDNS = "tcp://1.1.1.1"
 	}
-	if st.DNS.DirectDNS == "" || st.DNS.DirectDNS == "223.5.5.5" {
+	if st.DNS.DirectDNS == "" {
 		st.DNS.DirectDNS = "1.1.1.1"
 	}
 	if st.DNS.QueryStrategy == "" {
@@ -344,12 +579,12 @@ func saveState(st PanelState) error {
 	if err != nil {
 		return err
 	}
-	_ = os.MkdirAll(filepath.Dir(StateFile), 0755)
-	err = os.WriteFile(StateFile, data, 0644)
-	if errDir := os.MkdirAll(PersistDir, 0755); errDir == nil {
-		_ = os.WriteFile(PersistStateFile, data, 0644)
+	err1 := writeSyncedFile(StateFile, data)
+	err2 := writeSyncedFile(PersistStateFile, data)
+	if err1 != nil && err2 != nil {
+		return err1
 	}
-	return err
+	return nil
 }
 
 func listInstalledApps() []AndroidApp {
@@ -415,7 +650,7 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		remoteDNS = "tcp://1.1.1.1"
 	}
 	directDNS := strings.TrimSpace(st.DNS.DirectDNS)
-	if directDNS == "" || directDNS == "223.5.5.5" {
+	if directDNS == "" {
 		directDNS = "1.1.1.1"
 	}
 	queryStrategy := strings.TrimSpace(st.DNS.QueryStrategy)
@@ -472,15 +707,12 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 				map[string]interface{}{
 					"address":      directDNS,
 					"domains":      directDomains,
-					"skipFallback": true,
+					"skipFallback": false,
 				},
 				map[string]interface{}{
 					"address": remoteDNS,
-					"domains": []string{"geosite:geolocation-!cn"},
 				},
-				remoteDNS,
 				directDNS,
-				"1.1.1.1",
 				"localhost",
 			}
 		}
@@ -496,9 +728,11 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 				map[string]interface{}{
 					"address":      directDNS,
 					"domains":      directDomains,
-					"skipFallback": true,
+					"skipFallback": false,
 				},
-				remoteDNS,
+				map[string]interface{}{
+					"address": remoteDNS,
+				},
 				"localhost",
 			}
 		}
@@ -523,9 +757,21 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 			}
 			if tag, _ := inb["tag"].(string); tag == "socks-in" {
 				hasSocks = true
+				inb["sniffing"] = map[string]interface{}{
+					"enabled":      true,
+					"destOverride": []string{"http", "tls", "quic"},
+					"metadataOnly": false,
+					"routeOnly":    true,
+				}
 			}
 			if tag, _ := inb["tag"].(string); tag == "tproxy-in" {
 				inb["listen"] = "0.0.0.0"
+				inb["sniffing"] = map[string]interface{}{
+					"enabled":      true,
+					"destOverride": []string{"http", "tls", "quic"},
+					"metadataOnly": false,
+					"routeOnly":    true,
+				}
 				ss, _ := inb["streamSettings"].(map[string]interface{})
 				if ss == nil {
 					ss = map[string]interface{}{}
@@ -555,9 +801,37 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 				},
 				"sniffing": map[string]interface{}{
 					"enabled":      true,
-					"destOverride": []string{"http", "tls"},
+					"destOverride": []string{"http", "tls", "quic"},
+					"metadataOnly": false,
+					"routeOnly":    true,
 				},
 			})
+		}
+		hasDNSIn := false
+		if inbList, ok := cfg["inbounds"].([]interface{}); ok {
+			for _, item := range inbList {
+				if inb, ok := item.(map[string]interface{}); ok {
+					if tag, _ := inb["tag"].(string); tag == "dns-in" {
+						hasDNSIn = true
+						break
+					}
+				}
+			}
+		}
+		if !hasDNSIn {
+			if inbList, ok := cfg["inbounds"].([]interface{}); ok {
+				cfg["inbounds"] = append(inbList, map[string]interface{}{
+					"tag":      "dns-in",
+					"listen":   "0.0.0.0",
+					"port":     1053,
+					"protocol": "dokodemo-door",
+					"settings": map[string]interface{}{
+						"network": "tcp,udp",
+						"address": "1.1.1.1",
+						"port":    53,
+					},
+				})
+			}
 		}
 	}
 
@@ -604,19 +878,39 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 						ss["sockopt"] = sockopt
 					}
 					sockopt["mark"] = BypassMark
+
+					// Migrate deprecated freedom.domainStrategy to sockopt.domainStrategy
+					if proto, _ := ob["protocol"].(string); proto == "freedom" || tag == "direct" {
+						if settings, ok := ob["settings"].(map[string]interface{}); ok {
+							if ds, ok := settings["domainStrategy"].(string); ok && ds != "" {
+								sockopt["domainStrategy"] = ds
+								delete(settings, "domainStrategy")
+							}
+						}
+						if sockopt["domainStrategy"] == nil || sockopt["domainStrategy"] == "" {
+							sockopt["domainStrategy"] = queryStrategy
+						}
+					}
 				}
 			}
 		}
 	}
 
 	var rules []interface{}
-	// 1. Intercept all inbound DNS on port 53 to Xray internal DNS
-	rules = append(rules, map[string]interface{}{
-		"type":        "field",
-		"inboundTag":  []string{"tproxy-in"},
-		"port":        "53",
-		"outboundTag": "dns-out",
-	})
+	// 1. Intercept all inbound DNS to Xray internal DNS (dns-in dedicated port 1053, and port 53 for tproxy/socks)
+	rules = append(rules,
+		map[string]interface{}{
+			"type":        "field",
+			"inboundTag":  []string{"dns-in"},
+			"outboundTag": "dns-out",
+		},
+		map[string]interface{}{
+			"type":        "field",
+			"inboundTag":  []string{"tproxy-in", "socks-in"},
+			"port":        "53",
+			"outboundTag": "dns-out",
+		},
+	)
 
 	// 2. Direct DNS server traffic must ALWAYS go to direct outbound (port 53)
 	directHost := extractHost(directDNS)
@@ -639,6 +933,33 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 			"port":        "53",
 			"outboundTag": "direct",
 		})
+	}
+
+	// 3. Remote DNS server traffic should route to proxy outbound when proxy engine is active
+	if defaultOutbound == "proxy" {
+		if net.ParseIP(remoteHost) != nil {
+			if remoteHost != directHost {
+				rules = append(rules, map[string]interface{}{
+					"type":        "field",
+					"ip":          []string{remoteHost},
+					"outboundTag": "proxy",
+				})
+			} else if strings.HasPrefix(remoteDNS, "tcp://") {
+				rules = append(rules, map[string]interface{}{
+					"type":        "field",
+					"ip":          []string{remoteHost},
+					"port":        "53",
+					"network":     "tcp",
+					"outboundTag": "proxy",
+				})
+			}
+		} else if remoteHost != "" && remoteHost != "localhost" && remoteHost != directHost {
+			rules = append(rules, map[string]interface{}{
+				"type":        "field",
+				"domain":      []string{remoteHost},
+				"outboundTag": "proxy",
+			})
+		}
 	}
 
 	// 3. Active node and sub URL domain / IP must go to direct outbound (prevent proxy loop/deadlock)
@@ -672,7 +993,22 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		}
 	}
 
-	// 4. Routing mode specific rules:
+	// 4. Preserve custom user routing rules defined in BaseConfig (if any)
+	if origRouting, ok := cfg["routing"].(map[string]interface{}); ok {
+		if origRules, ok := origRouting["rules"].([]interface{}); ok {
+			for _, r := range origRules {
+				if rMap, ok := r.(map[string]interface{}); ok {
+					// Skip internal port 53 dns-out interceptor to prevent duplication
+					if port, _ := rMap["port"].(string); port == "53" && rMap["outboundTag"] == "dns-out" {
+						continue
+					}
+					rules = append(rules, rMap)
+				}
+			}
+		}
+	}
+
+	// 5. Routing mode specific rules:
 	switch st.ProxyMode {
 	case "rule":
 		rules = append(rules,
@@ -711,9 +1047,10 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 
 	routing, _ := cfg["routing"].(map[string]interface{})
 	if routing == nil {
-		routing = map[string]interface{}{"domainStrategy": "IPIfNonMatch"}
+		routing = map[string]interface{}{}
 		cfg["routing"] = routing
 	}
+	routing["domainStrategy"] = "IPIfNonMatch"
 	routing["rules"] = rules
 
 	finalBytes, err := json.MarshalIndent(cfg, "", "  ")
@@ -725,6 +1062,7 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 
 func configureKernelAndTether() {
 	writeSysctl("/proc/sys/net/ipv4/ip_forward", "1")
+	writeSysctl("/proc/sys/net/ipv4/ip_nonlocal_bind", "1")
 	writeSysctl("/proc/sys/net/ipv4/conf/all/rp_filter", "0")
 	writeSysctl("/proc/sys/net/ipv4/conf/default/rp_filter", "0")
 	if matches, err := filepath.Glob("/proc/sys/net/ipv4/conf/*/rp_filter"); err == nil {
@@ -760,6 +1098,8 @@ func configureKernelAndTether() {
 				writeSysctl(m, "1")
 			}
 		}
+		runCmdIgnoreErr("ip6tables", "-I", "FORWARD", "1", "-j", "DROP")
+		runCmdIgnoreErr("ip6tables", "-I", "OUTPUT", "1", "-j", "REJECT")
 	} else {
 		writeSysctl("/proc/sys/net/ipv6/conf/all/forwarding", "1")
 	}
@@ -798,6 +1138,11 @@ func setupTproxyIptables() error {
 	if err := runCmd("iptables", "-t", "mangle", "-N", "PASSWALL_OUT"); err != nil {
 		return err
 	}
+
+	_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_PRE",
+		"-m", "mark", "--mark", BypassHex+"/"+BypassHex, "-j", "RETURN")
+	runCmdIgnoreErr("iptables", "-t", "mangle", "-A", "PASSWALL_PRE",
+		"-p", "tcp", "-m", "socket", "-j", "ACCEPT")
 
 	_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
 		"-m", "owner", "--gid-owner", strconv.Itoa(XrayGID), "-j", "RETURN")
@@ -867,6 +1212,15 @@ func setupTproxyIptables() error {
 		}
 	}
 
+	// Reject DNS-over-TLS (port 853) so Android falls back immediately to port 53 DNS intercepted by Xray
+	_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
+	if st.LocalhostProxy {
+		_ = runCmd("iptables", "-I", "OUTPUT", "1",
+			"-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+			"-m", "mark", "!", "--mark", BypassHex+"/"+BypassHex,
+			"-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
+	}
+
 	if err := runCmd("iptables", "-t", "mangle", "-I", "PREROUTING", "1", "-j", "PASSWALL_PRE"); err != nil {
 		return err
 	}
@@ -877,6 +1231,9 @@ func setupTproxyIptables() error {
 	_ = runCmd("iptables", "-I", "INPUT", "1", "-m", "mark", "--mark", markSpec, "-j", "ACCEPT")
 	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", tproxyTarget, "-j", "ACCEPT")
 	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "udp", "--dport", tproxyTarget, "-j", "ACCEPT")
+	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", "1053", "-j", "ACCEPT")
+	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "udp", "--dport", "1053", "-j", "ACCEPT")
+	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", "9090", "-j", "ACCEPT")
 
 	_ = runCmd("iptables", "-I", "FORWARD", "1", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 	for i, iface := range []string{"ap+", "wlan+", "swlan+", "rndis+", "usb+", "eth+"} {
@@ -908,7 +1265,7 @@ func setupRedirectIptables() error {
 
 	for _, proto := range []string{"udp", "tcp"} {
 		_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_PRE",
-			"-p", proto, "--dport", "53", "-j", "REDIRECT", "--to-ports", redirPort)
+			"-p", proto, "--dport", "53", "-j", "REDIRECT", "--to-ports", "1053")
 	}
 
 	for _, cidr := range bypassCIDRsV4 {
@@ -925,6 +1282,15 @@ func setupRedirectIptables() error {
 		}
 	}
 
+	// Reject DNS-over-TLS (port 853) so Android falls back immediately to port 53 DNS intercepted by Xray
+	_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
+	if st.LocalhostProxy {
+		_ = runCmd("iptables", "-I", "OUTPUT", "1",
+			"-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+			"-m", "mark", "!", "--mark", BypassHex+"/"+BypassHex,
+			"-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
+	}
+
 	if err := runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_PRE",
 		"-p", "tcp", "-j", "REDIRECT", "--to-ports", redirPort); err != nil {
 		return err
@@ -935,7 +1301,7 @@ func setupRedirectIptables() error {
 	} else {
 		for _, proto := range []string{"udp", "tcp"} {
 			_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT",
-				"-p", proto, "--dport", "53", "-j", "REDIRECT", "--to-ports", redirPort)
+				"-p", proto, "--dport", "53", "-j", "REDIRECT", "--to-ports", "1053")
 		}
 		for _, cidr := range bypassCIDRsV4 {
 			_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT", "-d", cidr, "-j", "RETURN")
@@ -968,6 +1334,9 @@ func setupRedirectIptables() error {
 
 	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", redirPort, "-j", "ACCEPT")
 	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "udp", "--dport", redirPort, "-j", "ACCEPT")
+	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", "1053", "-j", "ACCEPT")
+	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "udp", "--dport", "1053", "-j", "ACCEPT")
+	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", "9090", "-j", "ACCEPT")
 
 	_ = runCmd("iptables", "-I", "FORWARD", "1", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 	for i, iface := range []string{"ap+", "wlan+", "swlan+", "rndis+", "usb+", "eth+"} {
@@ -1006,8 +1375,12 @@ func cleanupIptables() {
 	runCmdIgnoreErr("iptables", "-D", "INPUT", "-m", "mark", "--mark", markSpec, "-j", "ACCEPT")
 	runCmdIgnoreErr("iptables", "-D", "INPUT", "-p", "tcp", "--dport", tproxyTarget, "-j", "ACCEPT")
 	runCmdIgnoreErr("iptables", "-D", "INPUT", "-p", "udp", "--dport", tproxyTarget, "-j", "ACCEPT")
+	runCmdIgnoreErr("iptables", "-D", "INPUT", "-p", "tcp", "--dport", "1053", "-j", "ACCEPT")
+	runCmdIgnoreErr("iptables", "-D", "INPUT", "-p", "udp", "--dport", "1053", "-j", "ACCEPT")
+	runCmdIgnoreErr("iptables", "-D", "INPUT", "-p", "tcp", "--dport", "9090", "-j", "ACCEPT")
 
 	runCmdIgnoreErr("iptables", "-D", "FORWARD", "-p", "udp", "--dport", "443", "-j", "DROP")
+	runCmdIgnoreErr("iptables", "-D", "FORWARD", "-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
 	runCmdIgnoreErr("iptables", "-D", "FORWARD", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
 	for _, iface := range []string{"ap+", "wlan+", "swlan+", "rndis+", "usb+", "eth+"} {
 		runCmdIgnoreErr("iptables", "-D", "FORWARD", "-i", iface, "-j", "ACCEPT")
@@ -1018,6 +1391,11 @@ func cleanupIptables() {
 		"-p", "udp", "--dport", "443", "-j", "REJECT")
 	runCmdIgnoreErr("iptables", "-D", "OUTPUT", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
 		"-p", "udp", "--dport", "443", "-j", "REJECT")
+	runCmdIgnoreErr("iptables", "-D", "OUTPUT", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+		"-m", "mark", "!", "--mark", BypassHex+"/"+BypassHex,
+		"-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
+	runCmdIgnoreErr("ip6tables", "-D", "FORWARD", "-j", "DROP")
+	runCmdIgnoreErr("ip6tables", "-D", "OUTPUT", "-j", "REJECT")
 }
 
 func getAssetDir() string {
@@ -2280,9 +2658,20 @@ func startWebDashboard() {
 		}
 		if r.Method == http.MethodPost {
 			var req struct {
+				Action  string `json:"action"`
 				RawJSON string `json:"raw_json"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Action == "reset" {
+				if err := resetBaseConfig(); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				_ = restartProxyEngine()
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Config reset to factory default"})
+				return
+			}
 			var testObj interface{}
 			if err := json.Unmarshal([]byte(req.RawJSON), &testObj); err != nil {
 				w.Header().Set("Content-Type", "application/json")
@@ -2309,6 +2698,20 @@ func startWebDashboard() {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 		}
+	})
+
+	mux.HandleFunc("/api/config/reset", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := resetBaseConfig(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_ = restartProxyEngine()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Config reset to factory default"})
 	})
 
 	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
@@ -2399,11 +2802,25 @@ func main() {
 			if detectTproxy() {
 				mode = "TPROXY (mangle)"
 			}
-			fmt.Printf("Running (PID %d, Mode: %s, WebUI: http://%s)\n", pid, mode, WebListenAddr)
+			fmt.Printf("Running (PID %d, Mode: %s, WebUI: http://127.0.0.1:9090 or http://%s)\n", pid, mode, WebListenAddr)
 			os.Exit(0)
 		}
 		fmt.Println("Stopped")
 		os.Exit(1)
+
+	case "reset-config":
+		if err := resetBaseConfig(); err != nil {
+			fmt.Printf("Failed to reset config: %v\n", err)
+			os.Exit(1)
+		}
+		if pid, ok := isRunning(); ok {
+			p, _ := os.FindProcess(pid)
+			_ = p.Signal(syscall.SIGHUP)
+			fmt.Println("Base Xray config reset to default. Sent reload signal to passwall-droid.")
+		} else {
+			fmt.Println("Base Xray config reset to default.")
+		}
+		return
 
 	case "start":
 		if pid, ok := isRunning(); ok {
@@ -2411,7 +2828,7 @@ func main() {
 			return
 		}
 	default:
-		fmt.Printf("Usage: %s [start|stop|status]\n", filepath.Base(os.Args[0]))
+		fmt.Printf("Usage: %s [start|stop|status|reset-config]\n", filepath.Base(os.Args[0]))
 		os.Exit(1)
 	}
 
@@ -2451,14 +2868,15 @@ body{font-family:-apple-system,Roboto,sans-serif;background:#0f172a;color:#e2e8f
 .card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;margin-bottom:10px}
 .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px}
 .title{font-size:15px;font-weight:700;color:#f8fafc}
-.badge{display:inline-flex;align-items:center;justify-content:center;padding:4px 9px;border-radius:12px;font-size:11px;font-weight:700;line-height:1.2;text-align:center;vertical-align:middle}
-.badge-ver{display:inline-flex;align-items:center;justify-content:center;font-size:11px;padding:3px 7px;border-radius:6px;background:#334155;color:#94a3b8;font-weight:600;line-height:1.2;vertical-align:middle}
+.badge{display:inline-flex;align-items:center;justify-content:center;height:22px;min-height:22px;padding:0 9px;border-radius:11px;font-size:11px;font-weight:700;line-height:1;text-align:center;vertical-align:middle}
+.badge-ver{display:inline-flex;align-items:center;justify-content:center;height:20px;min-height:20px;font-size:11px;padding:0 7px;border-radius:5px;background:#334155;color:#94a3b8;font-weight:600;line-height:1;vertical-align:middle}
 .on{background:#065f46;color:#6ee7b7}
 .off{background:#7f1d1d;color:#fca5a5}
 .meta{font-size:12px;color:#94a3b8;margin-bottom:8px;word-break:break-all}
 .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-button{display:inline-flex;align-items:center;justify-content:center;border:none;border-radius:7px;padding:7px 11px;font-size:12px;font-weight:600;line-height:1.2;cursor:pointer;color:#fff;background:#334155;-webkit-tap-highlight-color:transparent;text-align:center;vertical-align:middle;box-sizing:border-box}
+button{appearance:none;-webkit-appearance:none;display:inline-flex;align-items:center;justify-content:center;border:none;border-radius:7px;padding:0 12px;height:32px;min-height:32px;font-size:12px;font-weight:600;line-height:1;cursor:pointer;color:#fff;background:#334155;-webkit-tap-highlight-color:transparent;text-align:center;vertical-align:middle;box-sizing:border-box}
 button:active{opacity:.8}
+.btn-sm{appearance:none;-webkit-appearance:none;display:inline-flex;align-items:center;justify-content:center;height:26px;min-height:26px;padding:0 8px;font-size:11px;line-height:1;border-radius:5px}
 .btn-green{background:#059669}
 .btn-red{background:#dc2626}
 .btn-blue{background:#2563eb}
@@ -2466,20 +2884,20 @@ button:active{opacity:.8}
 .btn-active{background:#0284c7;box-shadow:0 0 0 2px #38bdf8}
 .tabs{display:flex;gap:6px;margin-bottom:10px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-bottom:3px}
 .tabs::-webkit-scrollbar{display:none}
-.tab{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;text-align:center;padding:7px 13px;background:#1e293b;border:1px solid #334155;border-radius:8px;font-size:12px;font-weight:600;line-height:1.2;color:#94a3b8;cursor:pointer;white-space:nowrap;user-select:none;-webkit-user-select:none;vertical-align:middle}
+.tab{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;text-align:center;height:32px;min-height:32px;padding:0 14px;background:#1e293b;border:1px solid #334155;border-radius:8px;font-size:12px;font-weight:600;line-height:1;color:#94a3b8;cursor:pointer;white-space:nowrap;user-select:none;-webkit-user-select:none;vertical-align:middle}
 .tab.active{background:#2563eb;color:#fff;border-color:#2563eb}
-input,select,textarea{width:100%;background:#0f172a;border:1px solid #334155;border-radius:7px;color:#f8fafc;padding:8px;font-size:13px;margin-bottom:8px}
-textarea{font-family:monospace;font-size:12px;min-height:220px}
+input,select{width:100%;background:#0f172a;border:1px solid #334155;border-radius:7px;color:#f8fafc;padding:0 10px;height:34px;font-size:13px;line-height:1;margin-bottom:8px;box-sizing:border-box}
+textarea{width:100%;background:#0f172a;border:1px solid #334155;border-radius:7px;color:#f8fafc;padding:8px 10px;font-size:12px;font-family:monospace;min-height:220px;line-height:1.4;margin-bottom:8px;box-sizing:border-box}
 .node-item{display:flex;justify-content:space-between;align-items:center;background:#0f172a;border:1px solid #334155;border-radius:7px;padding:8px;margin-bottom:6px;flex-wrap:wrap;gap:6px}
 .node-item.selected{border-color:#38bdf8;background:#0c4a6e}
 .node-info{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 170px;min-width:0}
 .node-sub{font-size:11px;color:#94a3b8}
-.lat{display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;padding:3px 7px;border-radius:5px;background:#1e293b;line-height:1.2;vertical-align:middle}
+.lat{display:inline-flex;align-items:center;justify-content:center;height:26px;min-height:26px;font-size:11px;font-weight:700;padding:0 7px;border-radius:5px;background:#1e293b;line-height:1;vertical-align:middle}
 .lat-ok{color:#34d399}
 .lat-slow{color:#fbbf24}
 .lat-err{color:#f87171}
 .conn-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:6px 0 8px}
-.conn-pill{display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;padding:3px 8px;border-radius:12px;background:#334155;color:#94a3b8;line-height:1.2;vertical-align:middle}
+.conn-pill{display:inline-flex;align-items:center;justify-content:center;height:22px;min-height:22px;font-size:11px;font-weight:600;padding:0 8px;border-radius:11px;background:#334155;color:#94a3b8;line-height:1;vertical-align:middle}
 .conn-ok{background:#065f46;color:#6ee7b7}
 .conn-err{background:#7f1d1d;color:#fca5a5}
 .conn-wait{background:#854d0e;color:#fde047}
@@ -2506,7 +2924,7 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
     <span style="font-size:12px;color:#94a3b8;font-weight:600">Connectivity:</span>
     <span id="connGoogle" class="conn-pill">Google: --</span>
     <span id="connGithub" class="conn-pill">GitHub: --</span>
-    <button id="btnCheckConn" style="padding:3px 9px;font-size:11px" onclick="checkConn()">Check</button>
+    <button id="btnCheckConn" class="btn-sm" onclick="checkConn()">Check</button>
   </div>
   <div class="row">
     <button class="btn-green" style="flex:1" onclick="ctrl('start')">Start</button>
@@ -2548,7 +2966,7 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
     </label>
   </div>
   <div class="row" style="margin-bottom:10px">
-    <select id="subAutoSel" style="width:auto;margin:0;flex:1">
+    <select id="subAutoSel" style="width:auto;margin:0;flex:1;height:32px">
       <option value="0">Auto-Update: Off</option>
       <option value="6">Every 6 Hours</option>
       <option value="12">Every 12 Hours</option>
@@ -2566,8 +2984,8 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
   <div class="header">
     <div class="title" style="font-size:13px">Saved Nodes</div>
     <div class="row">
-      <button class="btn-amber" style="padding:5px 9px;font-size:11px" onclick="pingAll(false)">Ping All</button>
-      <button class="btn-green" style="padding:5px 9px;font-size:11px" onclick="pingAll(true)">Fastest</button>
+      <button class="btn-amber btn-sm" onclick="pingAll(false)">Ping All</button>
+      <button class="btn-green btn-sm" onclick="pingAll(true)">Fastest</button>
     </div>
   </div>
   <div id="nodeList"></div>
@@ -2580,21 +2998,21 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
   <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Remote DNS (Proxied / Foreign)</div>
   <input id="dnsRemoteInput" type="text" placeholder="tcp://1.1.1.1">
   <div class="row" style="margin-bottom:10px;flex-wrap:wrap;gap:4px">
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','tcp://1.1.1.1')">1.1.1.1 (TCP)</button>
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','1.1.1.1')">1.1.1.1 (UDP)</button>
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','tcp://8.8.8.8')">8.8.8.8 (TCP)</button>
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','https://1.1.1.1/dns-query')">Cloudflare DoH</button>
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','https://dns.google/dns-query')">Google DoH</button>
+    <button class="btn-sm" onclick="setDNSField('dnsRemoteInput','tcp://1.1.1.1')">1.1.1.1 (TCP)</button>
+    <button class="btn-sm" onclick="setDNSField('dnsRemoteInput','1.1.1.1')">1.1.1.1 (UDP)</button>
+    <button class="btn-sm" onclick="setDNSField('dnsRemoteInput','tcp://8.8.8.8')">8.8.8.8 (TCP)</button>
+    <button class="btn-sm" onclick="setDNSField('dnsRemoteInput','https://1.1.1.1/dns-query')">Cloudflare DoH</button>
+    <button class="btn-sm" onclick="setDNSField('dnsRemoteInput','https://dns.google/dns-query')">Google DoH</button>
   </div>
 
   <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Direct DNS (Domestic / Node Resolution)</div>
   <input id="dnsDirectInput" type="text" placeholder="1.1.1.1">
   <div class="row" style="margin-bottom:10px;flex-wrap:wrap;gap:4px">
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','1.1.1.1')">1.1.1.1 (Cloudflare UDP)</button>
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','localhost')">localhost (System DNS)</button>
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','10.202.10.202')">Shecan (10.202.10.202)</button>
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','77.88.8.8')">Yandex (77.88.8.8)</button>
-    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','223.5.5.5')">AliDNS (223.5.5.5)</button>
+    <button class="btn-sm" onclick="setDNSField('dnsDirectInput','1.1.1.1')">1.1.1.1 (Cloudflare UDP)</button>
+    <button class="btn-sm" onclick="setDNSField('dnsDirectInput','localhost')">localhost (System DNS)</button>
+    <button class="btn-sm" onclick="setDNSField('dnsDirectInput','10.202.10.202')">Shecan (10.202.10.202)</button>
+    <button class="btn-sm" onclick="setDNSField('dnsDirectInput','77.88.8.8')">Yandex (77.88.8.8)</button>
+    <button class="btn-sm" onclick="setDNSField('dnsDirectInput','223.5.5.5')">AliDNS (223.5.5.5)</button>
   </div>
 
   <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Query Strategy</div>
@@ -2624,13 +3042,14 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
   <div class="row">
     <button class="btn-green" onclick="saveConfig()">Save &amp; Apply</button>
     <button onclick="loadConfig()">Reload</button>
+    <button class="btn-red" onclick="resetConfig()">Reset to Default</button>
   </div>
 </div>
 
 <div id="p-logs" class="card hidden">
   <div class="header">
     <div class="title" style="font-size:13px">Runtime Logs</div>
-    <button class="btn-red" style="padding:5px 10px;font-size:11px" onclick="clearLogs()">Clear</button>
+    <button class="btn-red btn-sm" onclick="clearLogs()">Clear</button>
   </div>
   <pre id="logBox">Loading logs...</pre>
 </div>
@@ -2794,7 +3213,7 @@ function refreshStatus() {
     }
     if (!dnsInitialized && d.dns) {
       document.getElementById("dnsRemoteInput").value = d.dns.remote_dns || "tcp://1.1.1.1";
-      document.getElementById("dnsDirectInput").value = d.dns.direct_dns || "223.5.5.5";
+      document.getElementById("dnsDirectInput").value = d.dns.direct_dns || "1.1.1.1";
       document.getElementById("dnsStrategySel").value = d.dns.query_strategy || "UseIPv4";
       dnsInitialized = true;
     }
@@ -2808,10 +3227,13 @@ function refreshStatus() {
 function renderNodes(nodes, activeId) {
   var box = document.getElementById("nodeList");
   if (!nodes.length) {
-    box.innerHTML = '<div class="meta">No saved nodes. Using outbound from config.json.</div>';
+    box.innerHTML = '<div class="meta" style="color:#f59e0b;padding:6px 0;">⚠ No proxy nodes imported. Foreign sites (e.g. Google) require an active node to bypass censorship.</div>';
     return;
   }
   var html = "";
+  if (!activeId) {
+    html += '<div class="meta" style="color:#f59e0b;margin-bottom:6px;">⚠ No node currently active. Click &quot;Use&quot; on a node below to route traffic through it.</div>';
+  }
   for (var i = 0; i < nodes.length; i++) {
     var n = nodes[i];
     var sel = (n.id === activeId);
@@ -2826,9 +3248,9 @@ function renderNodes(nodes, activeId) {
       '<div class="node-info"><b>' + esc(n.name) + '</b><div class="node-sub">' +
       esc(n.protocol.toUpperCase()) + ' (' + esc(n.group || 'manual') + ') - ' + esc(n.address) + ':' + n.port + '</div></div>' +
       '<div class="row">' + latHtml +
-      '<button style="padding:5px 7px;font-size:11px" onclick="pingOne(\'' + n.id + '\')">Ping</button>' +
-      (sel ? '' : '<button class="btn-blue" style="padding:5px 8px;font-size:11px" onclick="nodeAct(\'select\',\'' + n.id + '\')">Use</button>') +
-      '<button class="btn-red" style="padding:5px 7px;font-size:11px" onclick="nodeAct(\'delete\',\'' + n.id + '\')">X</button>' +
+      '<button class="btn-sm" onclick="pingOne(\'' + n.id + '\')">Ping</button>' +
+      (sel ? '' : '<button class="btn-blue btn-sm" onclick="nodeAct(\'select\',\'' + n.id + '\')">Use</button>') +
+      '<button class="btn-red btn-sm" onclick="nodeAct(\'delete\',\'' + n.id + '\')">X</button>' +
       '</div></div>';
   }
   box.innerHTML = html;
@@ -2973,6 +3395,19 @@ function saveConfig() {
     else {
       var err = JSON.parse(text);
       showMsg(err.error || "Save failed");
+    }
+  });
+}
+
+function resetConfig() {
+  if (!confirm("Are you sure you want to reset Xray base config (config.json) to factory default? Any custom modifications will be lost.")) return;
+  req("POST", "/api/config/reset", {}, function(code, text) {
+    if (code === 200) {
+      showMsg("Config reset to default and restarted Xray.");
+      loadConfig();
+      refreshStatus();
+    } else {
+      showMsg("Reset failed: " + text);
     }
   });
 }
