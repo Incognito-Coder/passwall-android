@@ -352,3 +352,284 @@ func TestUpdateSubscriptionWithInsecureSSL(t *testing.T) {
 		t.Errorf("expected 2 imported nodes, got %d", count)
 	}
 }
+
+func TestExtractHost(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected string
+	}{
+		{"tcp://1.1.1.1", "1.1.1.1"},
+		{"tcp://1.1.1.1:53", "1.1.1.1"},
+		{"https://dns.google/dns-query", "dns.google"},
+		{"https://1.1.1.1:443/dns-query", "1.1.1.1"},
+		{"223.5.5.5", "223.5.5.5"},
+		{"10.202.10.202:53", "10.202.10.202"},
+		{"77.88.8.8", "77.88.8.8"},
+		{"  tcp://8.8.8.8  ", "8.8.8.8"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			got := extractHost(tc.input)
+			if got != tc.expected {
+				t.Errorf("extractHost(%q) = %q, expected %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestLoadStateDNSDefaults(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	defer func() { StateFile = origState }()
+
+	StateFile = filepath.Join(tmpDir, "state.json")
+
+	st := loadState()
+	if st.DNS.RemoteDNS != "tcp://1.1.1.1" {
+		t.Errorf("expected default remote DNS tcp://1.1.1.1, got %q", st.DNS.RemoteDNS)
+	}
+	if st.DNS.DirectDNS != "223.5.5.5" {
+		t.Errorf("expected default direct DNS 223.5.5.5, got %q", st.DNS.DirectDNS)
+	}
+	if st.DNS.QueryStrategy != "UseIPv4" {
+		t.Errorf("expected default query strategy UseIPv4, got %q", st.DNS.QueryStrategy)
+	}
+}
+
+func TestPrepareRuntimeConfigRoutingModes(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBase := BaseConfig
+	origState := StateFile
+	origRuntime := RuntimeConfig
+	defer func() {
+		BaseConfig = origBase
+		StateFile = origState
+		RuntimeConfig = origRuntime
+	}()
+
+	baseCfgPath := filepath.Join(tmpDir, "config.json")
+	statePath := filepath.Join(tmpDir, "state.json")
+	runtimePath := filepath.Join(tmpDir, "runtime.json")
+
+	BaseConfig = baseCfgPath
+	StateFile = statePath
+	RuntimeConfig = runtimePath
+
+	baseContent := `{
+		"inbounds": [
+			{
+				"tag": "tproxy-in",
+				"listen": "127.0.0.1",
+				"port": 12345,
+				"protocol": "dokodemo-door",
+				"streamSettings": {
+					"sockopt": {"tproxy": "tproxy"}
+				}
+			}
+		],
+		"outbounds": [
+			{"tag": "proxy", "protocol": "vless"},
+			{"tag": "direct", "protocol": "freedom"}
+		],
+		"routing": {"domainStrategy": "IPIfNonMatch", "rules": []}
+	}`
+	if err := os.WriteFile(baseCfgPath, []byte(baseContent), 0644); err != nil {
+		t.Fatalf("failed to write base config: %v", err)
+	}
+
+	testNode := NodeProfile{
+		ID:       "node-domain-1",
+		Name:     "DomainNode",
+		Protocol: "vless",
+		Address:  "myproxy.vpnserver.com",
+		Port:     443,
+		Outbound: map[string]interface{}{
+			"tag":      "proxy",
+			"protocol": "vless",
+		},
+	}
+
+	t.Run("Rule Mode with Active Domain Node", func(t *testing.T) {
+		st := PanelState{
+			ProxyMode:  "rule",
+			ActiveNode: "node-domain-1",
+			DNS: DNSConfig{
+				RemoteDNS:     "tcp://1.1.1.1",
+				DirectDNS:     "10.202.10.202",
+				QueryStrategy: "UseIPv4",
+			},
+			Nodes: []NodeProfile{testNode},
+		}
+		if err := saveState(st); err != nil {
+			t.Fatalf("saveState failed: %v", err)
+		}
+
+		if err := prepareRuntimeConfig(true); err != nil {
+			t.Fatalf("prepareRuntimeConfig failed: %v", err)
+		}
+
+		data, err := os.ReadFile(runtimePath)
+		if err != nil {
+			t.Fatalf("read runtime config failed: %v", err)
+		}
+
+		var cfg map[string]interface{}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			t.Fatalf("unmarshal runtime config failed: %v", err)
+		}
+
+		// Verify inbounds listen 0.0.0.0 for hotspot support
+		inbounds := cfg["inbounds"].([]interface{})
+		tproxyIn := inbounds[0].(map[string]interface{})
+		if tproxyIn["listen"] != "0.0.0.0" {
+			t.Errorf("expected tproxy-in listen 0.0.0.0, got %v", tproxyIn["listen"])
+		}
+
+		// Verify outbound direct has mark set
+		outbounds := cfg["outbounds"].([]interface{})
+		var directOb map[string]interface{}
+		for _, ob := range outbounds {
+			m := ob.(map[string]interface{})
+			if m["tag"] == "direct" {
+				directOb = m
+				break
+			}
+		}
+		if directOb == nil {
+			t.Fatalf("direct outbound not found")
+		}
+		ss := directOb["streamSettings"].(map[string]interface{})
+		sockopt := ss["sockopt"].(map[string]interface{})
+		if int(sockopt["mark"].(float64)) != BypassMark {
+			t.Errorf("expected bypass mark %d, got %v", BypassMark, sockopt["mark"])
+		}
+
+		// Verify DNS configuration includes active node domain in direct resolution
+		dnsCfg := cfg["dns"].(map[string]interface{})
+		if dnsCfg["queryStrategy"] != "UseIPv4" {
+			t.Errorf("expected queryStrategy UseIPv4, got %v", dnsCfg["queryStrategy"])
+		}
+		servers := dnsCfg["servers"].([]interface{})
+		directEntry := servers[1].(map[string]interface{})
+		domains := directEntry["domains"].([]interface{})
+		foundNodeDomain := false
+		for _, d := range domains {
+			if d == "myproxy.vpnserver.com" {
+				foundNodeDomain = true
+				break
+			}
+		}
+		if !foundNodeDomain {
+			t.Errorf("expected node domain in direct DNS domains, got: %v", domains)
+		}
+
+		// Verify routing rules: DNS intercepted, direct DNS routed direct, node domain routed direct
+		routing := cfg["routing"].(map[string]interface{})
+		rules := routing["rules"].([]interface{})
+		foundDNSOut := false
+		foundDirectDNSRule := false
+		foundNodeDomainRule := false
+
+		for _, r := range rules {
+			rm := r.(map[string]interface{})
+			if rm["outboundTag"] == "dns-out" {
+				foundDNSOut = true
+			}
+			if ips, ok := rm["ip"].([]interface{}); ok {
+				for _, ip := range ips {
+					if ip == "10.202.10.202" && rm["outboundTag"] == "direct" {
+						foundDirectDNSRule = true
+					}
+				}
+			}
+			if doms, ok := rm["domain"].([]interface{}); ok {
+				for _, dom := range doms {
+					if dom == "myproxy.vpnserver.com" && rm["outboundTag"] == "direct" {
+						foundNodeDomainRule = true
+					}
+				}
+			}
+		}
+
+		if !foundDNSOut {
+			t.Error("expected port 53 dns-out interception rule")
+		}
+		if !foundDirectDNSRule {
+			t.Error("expected direct DNS IP direct routing rule")
+		}
+		if !foundNodeDomainRule {
+			t.Error("expected proxy node domain direct routing rule to prevent deadlock")
+		}
+	})
+
+	t.Run("Global Mode Routing", func(t *testing.T) {
+		st := PanelState{
+			ProxyMode:  "global",
+			ActiveNode: "node-domain-1",
+			DNS: DNSConfig{
+				RemoteDNS:     "tcp://1.1.1.1",
+				DirectDNS:     "223.5.5.5",
+				QueryStrategy: "UseIPv4",
+			},
+			Nodes: []NodeProfile{testNode},
+		}
+		if err := saveState(st); err != nil {
+			t.Fatalf("saveState failed: %v", err)
+		}
+		if err := prepareRuntimeConfig(true); err != nil {
+			t.Fatalf("prepareRuntimeConfig failed: %v", err)
+		}
+
+		data, _ := os.ReadFile(runtimePath)
+		var cfg map[string]interface{}
+		_ = json.Unmarshal(data, &cfg)
+
+		routing := cfg["routing"].(map[string]interface{})
+		rules := routing["rules"].([]interface{})
+		foundPrivateDirect := false
+		for _, r := range rules {
+			rm := r.(map[string]interface{})
+			if ips, ok := rm["ip"].([]interface{}); ok {
+				for _, ip := range ips {
+					if ip == "geoip:private" && rm["outboundTag"] == "direct" {
+						foundPrivateDirect = true
+					}
+				}
+			}
+		}
+		if !foundPrivateDirect {
+			t.Error("expected geoip:private direct rule in global mode")
+		}
+	})
+
+	t.Run("Direct Mode Routing", func(t *testing.T) {
+		st := PanelState{
+			ProxyMode:  "direct",
+			ActiveNode: "node-domain-1",
+			DNS: DNSConfig{
+				RemoteDNS:     "tcp://1.1.1.1",
+				DirectDNS:     "223.5.5.5",
+				QueryStrategy: "UseIPv4",
+			},
+			Nodes: []NodeProfile{testNode},
+		}
+		if err := saveState(st); err != nil {
+			t.Fatalf("saveState failed: %v", err)
+		}
+		if err := prepareRuntimeConfig(true); err != nil {
+			t.Fatalf("prepareRuntimeConfig failed: %v", err)
+		}
+
+		data, _ := os.ReadFile(runtimePath)
+		var cfg map[string]interface{}
+		_ = json.Unmarshal(data, &cfg)
+
+		routing := cfg["routing"].(map[string]interface{})
+		rules := routing["rules"].([]interface{})
+		fallthroughRule := rules[len(rules)-1].(map[string]interface{})
+		if fallthroughRule["outboundTag"] != "direct" {
+			t.Errorf("expected fallthrough outboundTag direct in direct mode, got %v", fallthroughRule["outboundTag"])
+		}
+	})
+}

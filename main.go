@@ -24,7 +24,7 @@ import (
 	"time"
 )
 
-const (
+var (
 	BaseDir       = "/data/adb/modules/passwall-android"
 	XrayBin       = BaseDir + "/bin/xray"
 	BaseConfig    = BaseDir + "/config/config.json"
@@ -35,7 +35,9 @@ const (
 	PidFile       = "/dev/passwall-droid.pid"
 	PackagesFile  = "/data/system/packages.list"
 	WebListenAddr = "127.0.0.1:9090"
+)
 
+const (
 	TproxyPort  = 12345
 	XrayGID     = 23333
 	FwMark      = "0x01000000" // Bit 24: TPROXY route-to-lo mark
@@ -68,6 +70,12 @@ type NodeProfile struct {
 	Outbound  map[string]interface{} `json:"outbound"`
 }
 
+type DNSConfig struct {
+	RemoteDNS     string `json:"remote_dns"`     // e.g. "tcp://1.1.1.1", "tcp://8.8.8.8", "https://dns.google/dns-query"
+	DirectDNS     string `json:"direct_dns"`     // e.g. "223.5.5.5", "10.202.10.202", "77.88.8.8"
+	QueryStrategy string `json:"query_strategy"` // "UseIPv4", "UseIP", "UseIPv6"
+}
+
 type PanelState struct {
 	ProxyMode       string        `json:"proxy_mode"`        // "rule", "global", "direct"
 	ActiveNode      string        `json:"active_node"`
@@ -77,6 +85,7 @@ type PanelState struct {
 	LastSubUpdate   string        `json:"last_sub_update"`
 	AppFilterMode   string        `json:"app_filter_mode"` // "bypass" or "proxy"
 	SelectedUIDs    []int         `json:"selected_uids"`
+	DNS             DNSConfig     `json:"dns"`
 	Nodes           []NodeProfile `json:"nodes"`
 }
 
@@ -192,6 +201,15 @@ func loadState() PanelState {
 	if st.Nodes == nil {
 		st.Nodes = []NodeProfile{}
 	}
+	if st.DNS.RemoteDNS == "" {
+		st.DNS.RemoteDNS = "tcp://1.1.1.1"
+	}
+	if st.DNS.DirectDNS == "" {
+		st.DNS.DirectDNS = "223.5.5.5"
+	}
+	if st.DNS.QueryStrategy == "" {
+		st.DNS.QueryStrategy = "UseIPv4"
+	}
 	return st
 }
 
@@ -234,6 +252,21 @@ func listInstalledApps() []AndroidApp {
 	return apps
 }
 
+func extractHost(target string) string {
+	target = strings.TrimSpace(target)
+	if strings.Contains(target, "://") {
+		parts := strings.SplitN(target, "://", 2)
+		target = parts[1]
+	}
+	if idx := strings.Index(target, "/"); idx != -1 {
+		target = target[:idx]
+	}
+	if h, _, err := net.SplitHostPort(target); err == nil {
+		return h
+	}
+	return target
+}
+
 func prepareRuntimeConfig(tproxySupported bool) error {
 	raw, err := os.ReadFile(BaseConfig)
 	if err != nil {
@@ -246,6 +279,108 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 
 	st := loadState()
 
+	remoteDNS := strings.TrimSpace(st.DNS.RemoteDNS)
+	if remoteDNS == "" {
+		remoteDNS = "tcp://1.1.1.1"
+	}
+	directDNS := strings.TrimSpace(st.DNS.DirectDNS)
+	if directDNS == "" {
+		directDNS = "223.5.5.5"
+	}
+	queryStrategy := strings.TrimSpace(st.DNS.QueryStrategy)
+	if queryStrategy == "" {
+		queryStrategy = "UseIPv4"
+	}
+
+	// Identify active node domain and IP (if any)
+	var activeNodeDomain string
+	var activeNodeIP string
+	for _, n := range st.Nodes {
+		if n.ID == st.ActiveNode {
+			addr := strings.TrimSpace(n.Address)
+			if net.ParseIP(addr) != nil {
+				activeNodeIP = addr
+			} else if addr != "" {
+				activeNodeDomain = addr
+			}
+			break
+		}
+	}
+
+	defaultOutbound := "proxy"
+	if st.ActiveNode == "" || st.ProxyMode == "direct" {
+		defaultOutbound = "direct"
+	}
+
+	// Prepare direct domains (domestic Iranian/CN domains, node domain, sub domain)
+	directDomains := []string{"domain:ir", "geosite:ir", "geosite:cn"}
+	if activeNodeDomain != "" {
+		directDomains = append(directDomains, activeNodeDomain)
+	}
+	var subHost string
+	if st.SubURL != "" {
+		if subU, err := url.Parse(st.SubURL); err == nil && subU.Hostname() != "" {
+			subHost = subU.Hostname()
+			if net.ParseIP(subHost) == nil {
+				directDomains = append(directDomains, subHost)
+			}
+		}
+	}
+
+	var dnsServers []interface{}
+	switch st.ProxyMode {
+	case "rule":
+		if defaultOutbound == "direct" {
+			dnsServers = []interface{}{
+				directDNS,
+				"223.5.5.5",
+				"8.8.8.8",
+			}
+		} else {
+			dnsServers = []interface{}{
+				map[string]interface{}{
+					"address": remoteDNS,
+					"domains": []string{"geosite:geolocation-!cn"},
+				},
+				map[string]interface{}{
+					"address":      directDNS,
+					"domains":      directDomains,
+					"skipFallback": true,
+				},
+				remoteDNS,
+				directDNS,
+			}
+		}
+	case "global":
+		if defaultOutbound == "direct" {
+			dnsServers = []interface{}{
+				directDNS,
+				"223.5.5.5",
+				"8.8.8.8",
+			}
+		} else {
+			dnsServers = []interface{}{
+				map[string]interface{}{
+					"address":      directDNS,
+					"domains":      directDomains,
+					"skipFallback": true,
+				},
+				remoteDNS,
+				directDNS,
+			}
+		}
+	case "direct":
+		dnsServers = []interface{}{
+			directDNS,
+			"223.5.5.5",
+			"8.8.8.8",
+		}
+	}
+	cfg["dns"] = map[string]interface{}{
+		"servers":       dnsServers,
+		"queryStrategy": queryStrategy,
+	}
+
 	if inbounds, ok := cfg["inbounds"].([]interface{}); ok {
 		for _, item := range inbounds {
 			inb, ok := item.(map[string]interface{})
@@ -253,6 +388,7 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 				continue
 			}
 			if tag, _ := inb["tag"].(string); tag == "tproxy-in" {
+				inb["listen"] = "0.0.0.0"
 				ss, _ := inb["streamSettings"].(map[string]interface{})
 				if ss == nil {
 					ss = map[string]interface{}{}
@@ -298,20 +434,86 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		}
 	}
 
-	defaultOutbound := "proxy"
-	if st.ProxyMode == "direct" {
-		defaultOutbound = "direct"
+	// Ensure outbound 'direct' has mark set so direct packets never loop into Netfilter
+	if outbounds, ok := cfg["outbounds"].([]interface{}); ok {
+		for _, item := range outbounds {
+			if ob, ok := item.(map[string]interface{}); ok {
+				if tag, _ := ob["tag"].(string); tag == "direct" {
+					ss, _ := ob["streamSettings"].(map[string]interface{})
+					if ss == nil {
+						ss = map[string]interface{}{}
+						ob["streamSettings"] = ss
+					}
+					sockopt, _ := ss["sockopt"].(map[string]interface{})
+					if sockopt == nil {
+						sockopt = map[string]interface{}{}
+						ss["sockopt"] = sockopt
+					}
+					sockopt["mark"] = BypassMark
+				}
+			}
+		}
 	}
 
 	var rules []interface{}
+	// 1. Intercept all inbound DNS on port 53 to Xray internal DNS
 	rules = append(rules, map[string]interface{}{
 		"type":        "field",
 		"inboundTag":  []string{"tproxy-in"},
-		"port":        53,
+		"port":        "53",
 		"outboundTag": "dns-out",
 	})
 
-	if st.ProxyMode == "rule" {
+	// 2. Direct DNS server traffic must ALWAYS go to direct outbound
+	directHost := extractHost(directDNS)
+	if net.ParseIP(directHost) != nil {
+		rules = append(rules, map[string]interface{}{
+			"type":        "field",
+			"ip":          []string{directHost},
+			"outboundTag": "direct",
+		})
+	} else if directHost != "" {
+		rules = append(rules, map[string]interface{}{
+			"type":        "field",
+			"domain":      []string{directHost},
+			"outboundTag": "direct",
+		})
+	}
+
+	// 3. Active node and sub URL domain / IP must go to direct outbound (prevent proxy loop/deadlock)
+	if activeNodeDomain != "" {
+		rules = append(rules, map[string]interface{}{
+			"type":        "field",
+			"domain":      []string{activeNodeDomain},
+			"outboundTag": "direct",
+		})
+	}
+	if activeNodeIP != "" {
+		rules = append(rules, map[string]interface{}{
+			"type":        "field",
+			"ip":          []string{activeNodeIP},
+			"outboundTag": "direct",
+		})
+	}
+	if subHost != "" && subHost != activeNodeDomain && subHost != activeNodeIP {
+		if net.ParseIP(subHost) != nil {
+			rules = append(rules, map[string]interface{}{
+				"type":        "field",
+				"ip":          []string{subHost},
+				"outboundTag": "direct",
+			})
+		} else {
+			rules = append(rules, map[string]interface{}{
+				"type":        "field",
+				"domain":      []string{subHost},
+				"outboundTag": "direct",
+			})
+		}
+	}
+
+	// 4. Routing mode specific rules:
+	switch st.ProxyMode {
+	case "rule":
 		rules = append(rules,
 			map[string]interface{}{
 				"type":        "field",
@@ -320,23 +522,26 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 			},
 			map[string]interface{}{
 				"type":        "field",
-				"ip":          []string{"geoip:private", "geoip:ir"},
+				"domain":      []string{"domain:ir", "geosite:ir", "geosite:cn"},
 				"outboundTag": "direct",
 			},
 			map[string]interface{}{
 				"type":        "field",
-				"domain":      []string{"domain:ir", "geosite:ir"},
+				"ip":          []string{"geoip:private", "geoip:ir", "geoip:cn"},
 				"outboundTag": "direct",
 			},
 		)
-	} else {
+	case "global":
 		rules = append(rules, map[string]interface{}{
 			"type":        "field",
 			"ip":          []string{"geoip:private"},
 			"outboundTag": "direct",
 		})
+	case "direct":
+		// Direct mode: defaultOutbound is direct
 	}
 
+	// 5. Fallthrough rule
 	rules = append(rules, map[string]interface{}{
 		"type":        "field",
 		"network":     "tcp,udp",
@@ -361,16 +566,46 @@ func configureKernelAndTether() {
 	writeSysctl("/proc/sys/net/ipv4/ip_forward", "1")
 	writeSysctl("/proc/sys/net/ipv4/conf/all/rp_filter", "0")
 	writeSysctl("/proc/sys/net/ipv4/conf/default/rp_filter", "0")
+	if matches, err := filepath.Glob("/proc/sys/net/ipv4/conf/*/rp_filter"); err == nil {
+		for _, m := range matches {
+			writeSysctl(m, "0")
+		}
+	}
+
+	writeSysctl("/proc/sys/net/ipv4/conf/all/route_localnet", "1")
+	writeSysctl("/proc/sys/net/ipv4/conf/default/route_localnet", "1")
+	if matches, err := filepath.Glob("/proc/sys/net/ipv4/conf/*/route_localnet"); err == nil {
+		for _, m := range matches {
+			writeSysctl(m, "1")
+		}
+	}
+
+	if matches, err := filepath.Glob("/proc/sys/net/ipv4/conf/*/send_redirects"); err == nil {
+		for _, m := range matches {
+			writeSysctl(m, "0")
+		}
+	}
+	if matches, err := filepath.Glob("/proc/sys/net/ipv4/conf/*/accept_redirects"); err == nil {
+		for _, m := range matches {
+			writeSysctl(m, "0")
+		}
+	}
 
 	if DisableIPv6 {
 		writeSysctl("/proc/sys/net/ipv6/conf/all/disable_ipv6", "1")
 		writeSysctl("/proc/sys/net/ipv6/conf/default/disable_ipv6", "1")
+		if matches, err := filepath.Glob("/proc/sys/net/ipv6/conf/*/disable_ipv6"); err == nil {
+			for _, m := range matches {
+				writeSysctl(m, "1")
+			}
+		}
 	} else {
 		writeSysctl("/proc/sys/net/ipv6/conf/all/forwarding", "1")
 	}
 
 	runCmdIgnoreErr("settings", "put", "global", "tether_offload_disabled", "1")
 	runCmdIgnoreErr("ndc", "tether", "offload", "set", "false")
+	runCmdIgnoreErr("cmd", "connectivity", "tether", "offload", "set", "false")
 }
 
 func setupPolicyRouting() error {
@@ -424,8 +659,8 @@ func setupTproxyIptables() error {
 	}
 
 	if BlockQUIC {
-		_ = runCmd("iptables", "-I", "FORWARD", "-p", "udp", "--dport", "443", "-j", "DROP")
-		_ = runCmd("iptables", "-I", "OUTPUT", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+		_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "udp", "--dport", "443", "-j", "DROP")
+		_ = runCmd("iptables", "-I", "OUTPUT", "1", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
 			"-p", "udp", "--dport", "443", "-j", "REJECT")
 	}
 
@@ -459,10 +694,27 @@ func setupTproxyIptables() error {
 		}
 	}
 
-	if err := runCmd("iptables", "-t", "mangle", "-A", "PREROUTING", "-j", "PASSWALL_PRE"); err != nil {
+	if err := runCmd("iptables", "-t", "mangle", "-I", "PREROUTING", "1", "-j", "PASSWALL_PRE"); err != nil {
 		return err
 	}
-	return runCmd("iptables", "-t", "mangle", "-A", "OUTPUT", "-j", "PASSWALL_OUT")
+	if err := runCmd("iptables", "-t", "mangle", "-I", "OUTPUT", "1", "-j", "PASSWALL_OUT"); err != nil {
+		return err
+	}
+
+	_ = runCmd("iptables", "-I", "INPUT", "1", "-m", "mark", "--mark", markSpec, "-j", "ACCEPT")
+	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", tproxyTarget, "-j", "ACCEPT")
+	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "udp", "--dport", tproxyTarget, "-j", "ACCEPT")
+
+	_ = runCmd("iptables", "-I", "FORWARD", "1", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+	for i, iface := range []string{"ap+", "wlan+", "swlan+", "rndis+", "usb+", "eth+"} {
+		_ = runCmd("iptables", "-I", "FORWARD", strconv.Itoa(i+2), "-i", iface, "-j", "ACCEPT")
+	}
+
+	_ = runCmd("iptables", "-t", "nat", "-I", "POSTROUTING", "1", "-s", "192.168.0.0/16", "-j", "MASQUERADE")
+	_ = runCmd("iptables", "-t", "nat", "-I", "POSTROUTING", "1", "-s", "172.16.0.0/12", "-j", "MASQUERADE")
+	_ = runCmd("iptables", "-t", "nat", "-I", "POSTROUTING", "1", "-s", "10.0.0.0/8", "-j", "MASQUERADE")
+
+	return nil
 }
 
 func setupRedirectIptables() error {
@@ -494,8 +746,8 @@ func setupRedirectIptables() error {
 	}
 
 	if BlockQUIC {
-		_ = runCmd("iptables", "-I", "FORWARD", "-p", "udp", "--dport", "443", "-j", "DROP")
-		_ = runCmd("iptables", "-I", "OUTPUT", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+		_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "udp", "--dport", "443", "-j", "DROP")
+		_ = runCmd("iptables", "-I", "OUTPUT", "1", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
 			"-p", "udp", "--dport", "443", "-j", "REJECT")
 	}
 
@@ -521,13 +773,32 @@ func setupRedirectIptables() error {
 		}
 	}
 
-	if err := runCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-j", "PASSWALL_NAT_PRE"); err != nil {
+	if err := runCmd("iptables", "-t", "nat", "-I", "PREROUTING", "1", "-j", "PASSWALL_NAT_PRE"); err != nil {
 		return err
 	}
-	return runCmd("iptables", "-t", "nat", "-A", "OUTPUT", "-j", "PASSWALL_NAT_OUT")
+	if err := runCmd("iptables", "-t", "nat", "-I", "OUTPUT", "1", "-j", "PASSWALL_NAT_OUT"); err != nil {
+		return err
+	}
+
+	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", redirPort, "-j", "ACCEPT")
+	_ = runCmd("iptables", "-I", "INPUT", "1", "-p", "udp", "--dport", redirPort, "-j", "ACCEPT")
+
+	_ = runCmd("iptables", "-I", "FORWARD", "1", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+	for i, iface := range []string{"ap+", "wlan+", "swlan+", "rndis+", "usb+", "eth+"} {
+		_ = runCmd("iptables", "-I", "FORWARD", strconv.Itoa(i+2), "-i", iface, "-j", "ACCEPT")
+	}
+
+	_ = runCmd("iptables", "-t", "nat", "-I", "POSTROUTING", "1", "-s", "192.168.0.0/16", "-j", "MASQUERADE")
+	_ = runCmd("iptables", "-t", "nat", "-I", "POSTROUTING", "1", "-s", "172.16.0.0/12", "-j", "MASQUERADE")
+	_ = runCmd("iptables", "-t", "nat", "-I", "POSTROUTING", "1", "-s", "10.0.0.0/8", "-j", "MASQUERADE")
+
+	return nil
 }
 
 func cleanupIptables() {
+	tproxyTarget := strconv.Itoa(TproxyPort)
+	markSpec := FwMark + "/" + FwMask
+
 	runCmdIgnoreErr("iptables", "-t", "mangle", "-D", "PREROUTING", "-j", "PASSWALL_PRE")
 	runCmdIgnoreErr("iptables", "-t", "mangle", "-D", "OUTPUT", "-j", "PASSWALL_OUT")
 	runCmdIgnoreErr("iptables", "-t", "mangle", "-F", "PASSWALL_PRE")
@@ -542,7 +813,20 @@ func cleanupIptables() {
 	runCmdIgnoreErr("iptables", "-t", "nat", "-F", "PASSWALL_NAT_OUT")
 	runCmdIgnoreErr("iptables", "-t", "nat", "-X", "PASSWALL_NAT_OUT")
 
+	runCmdIgnoreErr("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", "192.168.0.0/16", "-j", "MASQUERADE")
+	runCmdIgnoreErr("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", "172.16.0.0/12", "-j", "MASQUERADE")
+	runCmdIgnoreErr("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", "10.0.0.0/8", "-j", "MASQUERADE")
+
+	runCmdIgnoreErr("iptables", "-D", "INPUT", "-m", "mark", "--mark", markSpec, "-j", "ACCEPT")
+	runCmdIgnoreErr("iptables", "-D", "INPUT", "-p", "tcp", "--dport", tproxyTarget, "-j", "ACCEPT")
+	runCmdIgnoreErr("iptables", "-D", "INPUT", "-p", "udp", "--dport", tproxyTarget, "-j", "ACCEPT")
+
 	runCmdIgnoreErr("iptables", "-D", "FORWARD", "-p", "udp", "--dport", "443", "-j", "DROP")
+	runCmdIgnoreErr("iptables", "-D", "FORWARD", "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT")
+	for _, iface := range []string{"ap+", "wlan+", "swlan+", "rndis+", "usb+", "eth+"} {
+		runCmdIgnoreErr("iptables", "-D", "FORWARD", "-i", iface, "-j", "ACCEPT")
+	}
+
 	runCmdIgnoreErr("iptables", "-D", "OUTPUT", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
 		"-p", "udp", "--dport", "443", "-j", "REJECT")
 }
@@ -664,7 +948,7 @@ func restartProxyEngine() error {
 }
 
 func watchdogLoop() {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -678,6 +962,12 @@ func watchdogLoop() {
 		}
 
 		writeSysctl("/proc/sys/net/ipv4/ip_forward", "1")
+		if matches, err := filepath.Glob("/proc/sys/net/ipv4/conf/*/rp_filter"); err == nil {
+			for _, m := range matches {
+				writeSysctl(m, "0")
+			}
+		}
+
 		if tproxy {
 			if err := runCmd("iptables", "-t", "mangle", "-C", "PREROUTING", "-j", "PASSWALL_PRE"); err != nil {
 				log.Println("[passwall-droid] watchdog: restoring flushed TPROXY rules...")
@@ -1325,10 +1615,12 @@ func startWebDashboard() {
 			"proxy_mode":        st.ProxyMode,
 			"active_node":       st.ActiveNode,
 			"sub_url":           st.SubURL,
+			"sub_insecure":      st.SubInsecure,
 			"auto_update_hours": st.AutoUpdateHours,
 			"last_sub_update":   st.LastSubUpdate,
 			"app_filter_mode":   st.AppFilterMode,
 			"selected_uids":     st.SelectedUIDs,
+			"dns":               st.DNS,
 			"nodes":             st.Nodes,
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -1384,6 +1676,39 @@ func startWebDashboard() {
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("/api/dns", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			st := loadState()
+			_ = json.NewEncoder(w).Encode(st.DNS)
+			return
+		}
+		if r.Method == http.MethodPost {
+			var req DNSConfig
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			st := loadState()
+			if strings.TrimSpace(req.RemoteDNS) != "" {
+				st.DNS.RemoteDNS = strings.TrimSpace(req.RemoteDNS)
+			}
+			if strings.TrimSpace(req.DirectDNS) != "" {
+				st.DNS.DirectDNS = strings.TrimSpace(req.DirectDNS)
+			}
+			if strings.TrimSpace(req.QueryStrategy) != "" {
+				st.DNS.QueryStrategy = strings.TrimSpace(req.QueryStrategy)
+			}
+			_ = saveState(st)
+			log.Printf("[passwall-droid] updated DNS settings: remote=%s direct=%s strategy=%s",
+				st.DNS.RemoteDNS, st.DNS.DirectDNS, st.DNS.QueryStrategy)
+			_ = restartProxyEngine()
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			return
+		}
+		http.Error(w, "GET or POST required", http.StatusMethodNotAllowed)
 	})
 
 	mux.HandleFunc("/api/sub", func(w http.ResponseWriter, r *http.Request) {
@@ -1761,6 +2086,7 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 
 <div class="tabs">
   <div class="tab active" id="t-nodes" onclick="showTab('nodes')">Nodes &amp; Sub</div>
+  <div class="tab" id="t-dns" onclick="showTab('dns')">DNS</div>
   <div class="tab" id="t-apps" onclick="showTab('apps')">Apps</div>
   <div class="tab" id="t-config" onclick="showTab('config')">Config</div>
   <div class="tab" id="t-logs" onclick="showTab('logs')">Logs</div>
@@ -1800,6 +2126,38 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
   <div id="nodeList"></div>
 </div>
 
+<div id="p-dns" class="card hidden">
+  <div class="title" style="font-size:13px;margin-bottom:6px">DNS Configuration</div>
+  <div class="meta" style="margin-bottom:10px">Internal Xray DNS resolver for phone &amp; tethered devices. Direct DNS resolves proxy domains and domestic traffic; Remote DNS handles proxied/blocked sites.</div>
+
+  <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Remote DNS (Proxied / Foreign)</div>
+  <input id="dnsRemoteInput" type="text" placeholder="tcp://1.1.1.1">
+  <div class="row" style="margin-bottom:10px">
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','tcp://1.1.1.1')">1.1.1.1 (TCP)</button>
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','tcp://8.8.8.8')">8.8.8.8 (TCP)</button>
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','https://dns.google/dns-query')">Google DoH</button>
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsRemoteInput','https://1.1.1.1/dns-query')">Cloudflare DoH</button>
+  </div>
+
+  <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Direct DNS (Domestic / Node Resolution)</div>
+  <input id="dnsDirectInput" type="text" placeholder="223.5.5.5">
+  <div class="row" style="margin-bottom:10px">
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','223.5.5.5')">223.5.5.5</button>
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','10.202.10.202')">Shecan (10.202.10.202)</button>
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','77.88.8.8')">Yandex (77.88.8.8)</button>
+    <button style="padding:4px 8px;font-size:11px" onclick="setDNSField('dnsDirectInput','8.8.8.8')">8.8.8.8</button>
+  </div>
+
+  <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Query Strategy</div>
+  <select id="dnsStrategySel" style="margin-bottom:12px">
+    <option value="UseIPv4">UseIPv4 (Recommended - Prevents IPv6 timeouts)</option>
+    <option value="UseIP">UseIP (Both IPv4 and IPv6)</option>
+    <option value="UseIPv6">UseIPv6 (IPv6 Preferred)</option>
+  </select>
+
+  <button class="btn-green" style="width:100%" onclick="saveDNS()">Save &amp; Apply DNS</button>
+</div>
+
 <div id="p-apps" class="card hidden">
   <div class="title" style="font-size:13px;margin-bottom:6px">Per-App Split Tunneling (Hotspot always proxied)</div>
   <select id="appModeSel">
@@ -1832,6 +2190,7 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 var cachedApps = [];
 var selectedUIDMap = {};
 var subInitialized = false;
+var dnsInitialized = false;
 
 function req(method, url, body, cb) {
   var xhr = new XMLHttpRequest();
@@ -1850,15 +2209,47 @@ function showMsg(txt) {
 }
 
 function showTab(name) {
-  var tabs = ["nodes", "apps", "config", "logs"];
+  var tabs = ["nodes", "dns", "apps", "config", "logs"];
   for (var i = 0; i < tabs.length; i++) {
     var t = tabs[i];
     document.getElementById("t-" + t).className = (t === name) ? "tab active" : "tab";
     document.getElementById("p-" + t).className = (t === name) ? "card" : "card hidden";
   }
+  if (name === "dns") { loadDNS(); }
   if (name === "apps") { loadApps(); }
   if (name === "config") { loadConfig(); }
   if (name === "logs") { loadLogs(); }
+}
+
+function setDNSField(id, val) {
+  document.getElementById(id).value = val;
+}
+
+function loadDNS() {
+  req("GET", "/api/dns", null, function(code, text) {
+    if (code !== 200) { return; }
+    var d = JSON.parse(text);
+    document.getElementById("dnsRemoteInput").value = d.remote_dns || "tcp://1.1.1.1";
+    document.getElementById("dnsDirectInput").value = d.direct_dns || "223.5.5.5";
+    document.getElementById("dnsStrategySel").value = d.query_strategy || "UseIPv4";
+    dnsInitialized = true;
+  });
+}
+
+function saveDNS() {
+  var r = document.getElementById("dnsRemoteInput").value;
+  var d = document.getElementById("dnsDirectInput").value;
+  var s = document.getElementById("dnsStrategySel").value;
+  showMsg("Applying DNS settings and reloading engine...");
+  req("POST", "/api/dns", {remote_dns: r, direct_dns: d, query_strategy: s}, function(code, text) {
+    if (code === 200) {
+      showMsg("DNS updated and proxy engine restarted.");
+      refreshStatus();
+    } else {
+      var err = JSON.parse(text);
+      showMsg("DNS error: " + (err.error || text));
+    }
+  });
 }
 
 function refreshStatus() {
@@ -1881,6 +2272,12 @@ function refreshStatus() {
       document.getElementById("subAutoSel").value = String(d.auto_update_hours || 0);
       document.getElementById("subInsecureChk").checked = !!d.sub_insecure;
       subInitialized = true;
+    }
+    if (!dnsInitialized && d.dns) {
+      document.getElementById("dnsRemoteInput").value = d.dns.remote_dns || "tcp://1.1.1.1";
+      document.getElementById("dnsDirectInput").value = d.dns.direct_dns || "223.5.5.5";
+      document.getElementById("dnsStrategySel").value = d.dns.query_strategy || "UseIPv4";
+      dnsInitialized = true;
     }
     document.getElementById("subMeta").innerHTML =
       "Last updated: " + (d.last_sub_update || "Never");
