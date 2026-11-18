@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -279,10 +280,16 @@ func TestParseShareURIHysteria(t *testing.T) {
 		if tlsSet["serverName"] != "sni.example.com" || tlsSet["allowInsecure"] != true {
 			t.Errorf("tls settings mismatch: %v", tlsSet)
 		}
+		if tlsSet["fingerprint"] != "chrome" {
+			t.Errorf("expected fingerprint chrome, got %v", tlsSet["fingerprint"])
+		}
 
 		hySet, _ := ss["hysteriaSettings"].(map[string]interface{})
 		if hySet["auth"] != "mypassword" || hySet["version"] != 2 {
 			t.Errorf("hysteria settings mismatch: %v", hySet)
+		}
+		if hySet["udpIdleTimeout"] != 60 {
+			t.Errorf("expected udpIdleTimeout 60, got %v", hySet["udpIdleTimeout"])
 		}
 	})
 
@@ -309,6 +316,9 @@ func TestParseShareURIHysteria(t *testing.T) {
 		udpEntry := udpArr[0].(map[string]interface{})
 		if udpEntry["type"] != "salamander" {
 			t.Errorf("expected salamander type, got %v", udpEntry["type"])
+		}
+		if udpmasks, ok := ss["udpmasks"].([]interface{}); !ok || len(udpmasks) == 0 {
+			t.Errorf("expected udpmasks array in streamSettings for compatibility")
 		}
 	})
 
@@ -704,7 +714,7 @@ func TestApiStatusIncludesVersions(t *testing.T) {
 	BaseDir = tmpDir
 	StateFile = filepath.Join(tmpDir, "state.json")
 
-	propContent := "id=passwall-android\nversion=v1.2.2\nversionCode=122\n"
+	propContent := "id=passwall-android\nversion=v1.2.3\nversionCode=123\n"
 	_ = os.WriteFile(filepath.Join(tmpDir, "module.prop"), []byte(propContent), 0644)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -732,8 +742,8 @@ func TestApiStatusIncludesVersions(t *testing.T) {
 		t.Fatalf("unmarshal status response failed: %v", err)
 	}
 
-	if res["module_version"] != "v1.2.2" {
-		t.Errorf("expected module_version v1.2.2, got %v", res["module_version"])
+	if res["module_version"] != "v1.2.3" {
+		t.Errorf("expected module_version v1.2.3, got %v", res["module_version"])
 	}
 	if _, ok := res["xray_version"]; !ok {
 		t.Error("expected xray_version field in status response")
@@ -1228,5 +1238,91 @@ func TestApiModeSwitchAndAutoRestart(t *testing.T) {
 	saved := loadState()
 	if saved.ProxyMode != "global" {
 		t.Errorf("expected mode global, got %s", saved.ProxyMode)
+	}
+}
+
+func TestProxyOutboundSockoptMark(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBase := BaseConfig
+	origState := StateFile
+	origRuntime := RuntimeConfig
+	defer func() {
+		BaseConfig = origBase
+		StateFile = origState
+		RuntimeConfig = origRuntime
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	StateFile = filepath.Join(tmpDir, "state.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+
+	baseJSON := `{"inbounds":[],"outbounds":[{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[]}}`
+	_ = os.WriteFile(BaseConfig, []byte(baseJSON), 0644)
+
+	st := PanelState{
+		ProxyMode:  "rule",
+		ActiveNode: "hy-1",
+		Nodes: []NodeProfile{
+			{
+				ID:       "hy-1",
+				Name:     "HyNode",
+				Protocol: "hysteria2",
+				Address:  "198.51.100.10",
+				Port:     443,
+				Outbound: map[string]interface{}{
+					"tag":      "proxy",
+					"protocol": "hysteria",
+					"streamSettings": map[string]interface{}{
+						"network": "hysteria",
+					},
+				},
+			},
+		},
+	}
+	_ = saveState(st)
+
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig failed: %v", err)
+	}
+
+	data, err := os.ReadFile(RuntimeConfig)
+	if err != nil {
+		t.Fatalf("read runtime config failed: %v", err)
+	}
+	var cfg map[string]interface{}
+	_ = json.Unmarshal(data, &cfg)
+
+	outbounds := cfg["outbounds"].([]interface{})
+	var proxyOb map[string]interface{}
+	for _, ob := range outbounds {
+		m := ob.(map[string]interface{})
+		if m["tag"] == "proxy" {
+			proxyOb = m
+			break
+		}
+	}
+	if proxyOb == nil {
+		t.Fatalf("expected proxy outbound in generated config")
+	}
+
+	ss, ok := proxyOb["streamSettings"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected streamSettings in proxy outbound")
+	}
+	sockopt, ok := ss["sockopt"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected sockopt in proxy outbound streamSettings")
+	}
+	if int(sockopt["mark"].(float64)) != BypassMark {
+		t.Errorf("expected proxy outbound mark %d, got %v", BypassMark, sockopt["mark"])
+	}
+}
+
+func TestButtonAndBadgeCSSStyles(t *testing.T) {
+	if !strings.Contains(dashboardHTML, "display:inline-flex;align-items:center;justify-content:center") {
+		t.Errorf("expected inline-flex vertical centering styles in dashboardHTML")
+	}
+	if !strings.Contains(dashboardHTML, ".badge-ver") {
+		t.Errorf("expected .badge-ver in dashboardHTML")
 	}
 }

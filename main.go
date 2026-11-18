@@ -35,7 +35,7 @@ var (
 	PidFile       = "/dev/passwall-droid.pid"
 	PackagesFile  = "/data/system/packages.list"
 	WebListenAddr = "127.0.0.1:9090"
-	AppVersion    = "v1.2.2"
+	AppVersion    = "v1.2.3"
 
 	PersistDir        = "/data/adb/passwall"
 	PersistBaseConfig = PersistDir + "/config.json"
@@ -587,11 +587,12 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		}
 	}
 
-	// Ensure outbound 'direct' has mark set so direct packets never loop into Netfilter
+	// Ensure outbounds 'direct' and 'proxy' have mark set so packets never loop into Netfilter
 	if outbounds, ok := cfg["outbounds"].([]interface{}); ok {
 		for _, item := range outbounds {
 			if ob, ok := item.(map[string]interface{}); ok {
-				if tag, _ := ob["tag"].(string); tag == "direct" {
+				tag, _ := ob["tag"].(string)
+				if tag == "direct" || tag == "proxy" {
 					ss, _ := ob["streamSettings"].(map[string]interface{})
 					if ss == nil {
 						ss = map[string]interface{}{}
@@ -859,7 +860,9 @@ func setupTproxyIptables() error {
 	if BlockQUIC {
 		_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "udp", "--dport", "443", "-j", "DROP")
 		if st.LocalhostProxy {
-			_ = runCmd("iptables", "-I", "OUTPUT", "1", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+			_ = runCmd("iptables", "-I", "OUTPUT", "1",
+				"-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+				"-m", "mark", "!", "--mark", BypassHex+"/"+BypassHex,
 				"-p", "udp", "--dport", "443", "-j", "REJECT")
 		}
 	}
@@ -915,7 +918,9 @@ func setupRedirectIptables() error {
 	if BlockQUIC {
 		_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "udp", "--dport", "443", "-j", "DROP")
 		if st.LocalhostProxy {
-			_ = runCmd("iptables", "-I", "OUTPUT", "1", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+			_ = runCmd("iptables", "-I", "OUTPUT", "1",
+				"-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+				"-m", "mark", "!", "--mark", BypassHex+"/"+BypassHex,
 				"-p", "udp", "--dport", "443", "-j", "REJECT")
 		}
 	}
@@ -1008,6 +1013,9 @@ func cleanupIptables() {
 		runCmdIgnoreErr("iptables", "-D", "FORWARD", "-i", iface, "-j", "ACCEPT")
 	}
 
+	runCmdIgnoreErr("iptables", "-D", "OUTPUT", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+		"-m", "mark", "!", "--mark", BypassHex+"/"+BypassHex,
+		"-p", "udp", "--dport", "443", "-j", "REJECT")
 	runCmdIgnoreErr("iptables", "-D", "OUTPUT", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
 		"-p", "udp", "--dport", "443", "-j", "REJECT")
 }
@@ -1403,13 +1411,45 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 			"alpn":          alpnList,
 			"allowInsecure": allowInsecure,
 		}
+		fp := q.Get("fp")
+		if fp == "" {
+			fp = q.Get("fingerprint")
+		}
+		if fp == "" {
+			fp = "chrome"
+		}
+		tlsSettings["fingerprint"] = fp
+
 		if pin := q.Get("pinSHA256"); pin != "" {
 			tlsSettings["pinnedPeerCertificateSha256"] = pin
 		}
 
 		hysteriaSettings := map[string]interface{}{
-			"version": 2,
-			"auth":    auth,
+			"version":        2,
+			"auth":           auth,
+			"udpIdleTimeout": 60,
+		}
+
+		up := q.Get("up")
+		if up == "" {
+			up = q.Get("upmbps")
+		}
+		if up != "" {
+			if !strings.Contains(up, " ") {
+				up = up + " mbps"
+			}
+			hysteriaSettings["up"] = up
+		}
+
+		down := q.Get("down")
+		if down == "" {
+			down = q.Get("downmbps")
+		}
+		if down != "" {
+			if !strings.Contains(down, " ") {
+				down = down + " mbps"
+			}
+			hysteriaSettings["down"] = down
 		}
 
 		ss := map[string]interface{}{
@@ -1422,16 +1462,18 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 		obfsType := q.Get("obfs")
 		obfsPass := q.Get("obfs-password")
 		if obfsType != "" && obfsPass != "" {
-			ss["finalmask"] = map[string]interface{}{
-				"udp": []interface{}{
-					map[string]interface{}{
-						"type": obfsType,
-						"settings": map[string]interface{}{
-							"password": obfsPass,
-						},
+			maskObj := []interface{}{
+				map[string]interface{}{
+					"type": obfsType,
+					"settings": map[string]interface{}{
+						"password": obfsPass,
 					},
 				},
 			}
+			ss["finalmask"] = map[string]interface{}{
+				"udp": maskObj,
+			}
+			ss["udpmasks"] = maskObj
 		}
 
 		ob := map[string]interface{}{
@@ -1670,25 +1712,75 @@ func subscriptionAutoUpdater() {
 	}
 }
 
-func measureNodeLatency(n NodeProfile) int {
+func measureHysteriaLatency(n NodeProfile, dialer *net.Dialer) int {
 	target := net.JoinHostPort(n.Address, strconv.Itoa(n.Port))
-	dialer := directDialer(4 * time.Second)
+	start := time.Now()
 
+	uConn, err := dialer.Dial("udp", target)
+	if err != nil {
+		return -1
+	}
+	defer uConn.Close()
+
+	// Send RFC 9000 QUIC Version Negotiation probe datagram (1200 bytes)
+	probe := make([]byte, 1200)
+	probe[0] = 0xc0 // Long Header, Initial
+	// 0x1a2a3a4a: experimental/unsupported version to force Version Negotiation
+	probe[1], probe[2], probe[3], probe[4] = 0x1a, 0x2a, 0x3a, 0x4a
+	probe[5] = 8 // DCIL
+	copy(probe[6:14], []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08})
+	probe[14] = 8 // SCIL
+	copy(probe[15:23], []byte{0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01})
+
+	_ = uConn.SetDeadline(time.Now().Add(2500 * time.Millisecond))
+	if _, err := uConn.Write(probe); err != nil {
+		return -1
+	}
+
+	buf := make([]byte, 1500)
+	nBytes, err := uConn.Read(buf)
+	if err == nil && nBytes > 0 {
+		ms := int(time.Since(start).Milliseconds())
+		if ms < 1 {
+			ms = 1
+		}
+		return ms
+	}
+
+	// For obfuscated UDP servers (e.g. Salamander) that drop unmasked QUIC probes,
+	// test if server has a reachable TCP listener or responding endpoint:
+	tcpDialer := directDialer(1500 * time.Millisecond)
+	tcpStart := time.Now()
+	if tConn, tErr := tcpDialer.Dial("tcp", target); tErr == nil {
+		_ = tConn.Close()
+		ms := int(time.Since(tcpStart).Milliseconds())
+		if ms < 1 {
+			ms = 1
+		}
+		return ms
+	}
+
+	// If UDP socket write completed without socket failure within reasonable RTT:
+	ms := int(time.Since(start).Milliseconds())
+	if ms < 1 {
+		ms = 1
+	}
+	if ms < 1000 {
+		return ms
+	}
+	return -1
+}
+
+func measureNodeLatency(n NodeProfile) int {
+	dialer := directDialer(4 * time.Second)
+	if n.Protocol == "hysteria2" || n.Protocol == "hysteria" {
+		return measureHysteriaLatency(n, dialer)
+	}
+
+	target := net.JoinHostPort(n.Address, strconv.Itoa(n.Port))
 	start := time.Now()
 	conn, err := dialer.Dial("tcp", target)
 	if err != nil {
-		if n.Protocol == "hysteria2" || n.Protocol == "hysteria" {
-			uConn, uErr := dialer.Dial("udp", target)
-			if uErr != nil {
-				return -1
-			}
-			_ = uConn.Close()
-			ms := int(time.Since(start).Milliseconds())
-			if ms < 1 {
-				ms = 1
-			}
-			return ms
-		}
 		return -1
 	}
 	defer conn.Close()
@@ -2340,12 +2432,13 @@ body{font-family:-apple-system,Roboto,sans-serif;background:#0f172a;color:#e2e8f
 .card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;margin-bottom:10px}
 .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px}
 .title{font-size:15px;font-weight:700;color:#f8fafc}
-.badge{padding:3px 9px;border-radius:12px;font-size:11px;font-weight:700}
+.badge{display:inline-flex;align-items:center;justify-content:center;padding:4px 9px;border-radius:12px;font-size:11px;font-weight:700;line-height:1.2;text-align:center;vertical-align:middle}
+.badge-ver{display:inline-flex;align-items:center;justify-content:center;font-size:11px;padding:3px 7px;border-radius:6px;background:#334155;color:#94a3b8;font-weight:600;line-height:1.2;vertical-align:middle}
 .on{background:#065f46;color:#6ee7b7}
 .off{background:#7f1d1d;color:#fca5a5}
 .meta{font-size:12px;color:#94a3b8;margin-bottom:8px;word-break:break-all}
 .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-button{border:none;border-radius:7px;padding:8px 11px;font-size:12px;font-weight:600;cursor:pointer;color:#fff;background:#334155;-webkit-tap-highlight-color:transparent}
+button{display:inline-flex;align-items:center;justify-content:center;border:none;border-radius:7px;padding:7px 11px;font-size:12px;font-weight:600;line-height:1.2;cursor:pointer;color:#fff;background:#334155;-webkit-tap-highlight-color:transparent;text-align:center;vertical-align:middle;box-sizing:border-box}
 button:active{opacity:.8}
 .btn-green{background:#059669}
 .btn-red{background:#dc2626}
@@ -2354,7 +2447,7 @@ button:active{opacity:.8}
 .btn-active{background:#0284c7;box-shadow:0 0 0 2px #38bdf8}
 .tabs{display:flex;gap:6px;margin-bottom:10px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-bottom:3px}
 .tabs::-webkit-scrollbar{display:none}
-.tab{flex:0 0 auto;text-align:center;padding:8px 13px;background:#1e293b;border:1px solid #334155;border-radius:8px;font-size:12px;font-weight:600;color:#94a3b8;cursor:pointer;white-space:nowrap;user-select:none;-webkit-user-select:none}
+.tab{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;text-align:center;padding:7px 13px;background:#1e293b;border:1px solid #334155;border-radius:8px;font-size:12px;font-weight:600;line-height:1.2;color:#94a3b8;cursor:pointer;white-space:nowrap;user-select:none;-webkit-user-select:none;vertical-align:middle}
 .tab.active{background:#2563eb;color:#fff;border-color:#2563eb}
 input,select,textarea{width:100%;background:#0f172a;border:1px solid #334155;border-radius:7px;color:#f8fafc;padding:8px;font-size:13px;margin-bottom:8px}
 textarea{font-family:monospace;font-size:12px;min-height:220px}
@@ -2362,12 +2455,12 @@ textarea{font-family:monospace;font-size:12px;min-height:220px}
 .node-item.selected{border-color:#38bdf8;background:#0c4a6e}
 .node-info{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 170px;min-width:0}
 .node-sub{font-size:11px;color:#94a3b8}
-.lat{font-size:11px;font-weight:700;padding:2px 6px;border-radius:5px;background:#1e293b}
+.lat{display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;padding:3px 7px;border-radius:5px;background:#1e293b;line-height:1.2;vertical-align:middle}
 .lat-ok{color:#34d399}
 .lat-slow{color:#fbbf24}
 .lat-err{color:#f87171}
 .conn-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:6px 0 8px}
-.conn-pill{font-size:11px;font-weight:600;padding:3px 8px;border-radius:12px;background:#334155;color:#94a3b8;display:inline-flex;align-items:center}
+.conn-pill{display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;padding:3px 8px;border-radius:12px;background:#334155;color:#94a3b8;line-height:1.2;vertical-align:middle}
 .conn-ok{background:#065f46;color:#6ee7b7}
 .conn-err{background:#7f1d1d;color:#fca5a5}
 .conn-wait{background:#854d0e;color:#fde047}
@@ -2385,7 +2478,7 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
   <div class="header">
     <div class="title" style="display:flex;align-items:center;gap:6px">
       <span>Passwall Android</span>
-      <span id="modVerBadge" style="font-size:11px;padding:2px 6px;border-radius:5px;background:#334155;color:#94a3b8;font-weight:600">--</span>
+      <span id="modVerBadge" class="badge-ver">--</span>
     </div>
     <span id="statusBadge" class="badge off">LOADING</span>
   </div>
