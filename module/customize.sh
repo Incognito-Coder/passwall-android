@@ -21,6 +21,37 @@ esac
 
 rm -rf "$MODPATH/bin/arm" "$MODPATH/bin/arm64"
 
+# --------------------------------------------------------------------------
+# Preserve user configuration (config.json) & UI state (state.json)
+# --------------------------------------------------------------------------
+OLD_MOD="/data/adb/modules/passwall-android"
+PERSIST_DIR="/data/adb/passwall"
+mkdir -p "$PERSIST_DIR"
+mkdir -p "$MODPATH/config"
+
+# 1. Preserve or restore state.json (UI state: nodes, subscriptions, DNS, app split tunneling)
+if [ -f "$OLD_MOD/config/state.json" ]; then
+  ui_print "- Preserving existing UI configuration (nodes, subscriptions, DNS, apps)"
+  cp -f "$OLD_MOD/config/state.json" "$MODPATH/config/state.json"
+  cp -f "$OLD_MOD/config/state.json" "$PERSIST_DIR/state.json"
+elif [ -f "$PERSIST_DIR/state.json" ]; then
+  ui_print "- Restoring UI configuration from persistent storage"
+  cp -f "$PERSIST_DIR/state.json" "$MODPATH/config/state.json"
+fi
+
+# 2. Preserve or restore config.json (Base Xray core configuration)
+if [ -f "$OLD_MOD/config/config.json" ]; then
+  ui_print "- Preserving existing base Xray config (config.json)"
+  cp -f "$OLD_MOD/config/config.json" "$MODPATH/config/config.json"
+  cp -f "$OLD_MOD/config/config.json" "$PERSIST_DIR/config.json"
+elif [ -f "$PERSIST_DIR/config.json" ]; then
+  ui_print "- Restoring base Xray config from persistent storage"
+  cp -f "$PERSIST_DIR/config/config.json" "$MODPATH/config/config.json"
+else
+  # Fresh installation: initialize persistent backup
+  cp -f "$MODPATH/config/config.json" "$PERSIST_DIR/config.json"
+fi
+
 mkdir -p "$MODPATH/system/bin"
 cat << 'CLI' > "$MODPATH/system/bin/passwall"
 #!/system/bin/sh
@@ -28,6 +59,7 @@ exec /data/adb/modules/passwall-android/bin/passwall-droid "$@"
 CLI
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
+set_perm_recursive "$PERSIST_DIR" 0 0 0755 0644
 set_perm "$MODPATH/bin/passwall-droid" 0 0 0755
 set_perm "$MODPATH/bin/xray" 0 0 0755
 set_perm "$MODPATH/system/bin/passwall" 0 0 0755

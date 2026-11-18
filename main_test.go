@@ -725,3 +725,125 @@ func TestApiStatusIncludesVersions(t *testing.T) {
 		t.Error("expected xray_version field in status response")
 	}
 }
+
+func TestPersistentStateBackupAndRestore(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersistDir := PersistDir
+	origPersistState := PersistStateFile
+	defer func() {
+		StateFile = origState
+		PersistDir = origPersistDir
+		PersistStateFile = origPersistState
+	}()
+
+	StateFile = filepath.Join(tmpDir, "modules", "passwall-android", "config", "state.json")
+	PersistDir = filepath.Join(tmpDir, "persist", "passwall")
+	PersistStateFile = filepath.Join(PersistDir, "state.json")
+
+	// 1. User configures state
+	customState := PanelState{
+		ProxyMode:     "global",
+		ActiveNode:    "custom-node-123",
+		SubURL:        "https://mysub.link/all",
+		SubInsecure:   true,
+		AppFilterMode: "proxy",
+		SelectedUIDs:  []int{10150, 10151},
+		DNS: DNSConfig{
+			RemoteDNS:     "https://dns.google/dns-query",
+			DirectDNS:     "10.202.10.202",
+			QueryStrategy: "UseIP",
+		},
+		Nodes: []NodeProfile{
+			{ID: "custom-node-123", Name: "MyPersistentNode", Protocol: "vless", Address: "vpn.test.org", Port: 443},
+		},
+	}
+
+	if err := saveState(customState); err != nil {
+		t.Fatalf("saveState failed: %v", err)
+	}
+
+	// Verify it was saved to both active StateFile and PersistStateFile
+	if _, err := os.Stat(StateFile); err != nil {
+		t.Fatalf("StateFile not created: %v", err)
+	}
+	if _, err := os.Stat(PersistStateFile); err != nil {
+		t.Fatalf("PersistStateFile not created: %v", err)
+	}
+
+	// 2. Simulate module update from ZIP: modules/passwall-android directory is replaced / state.json is removed
+	_ = os.Remove(StateFile)
+	if _, err := os.Stat(StateFile); !os.IsNotExist(err) {
+		t.Fatal("expected StateFile to be deleted")
+	}
+
+	// 3. Call loadState() -> should automatically restore from PersistStateFile without losing anything
+	restoredState := loadState()
+	if restoredState.ActiveNode != "custom-node-123" {
+		t.Errorf("expected active node custom-node-123, got %q", restoredState.ActiveNode)
+	}
+	if restoredState.ProxyMode != "global" {
+		t.Errorf("expected proxy mode global, got %q", restoredState.ProxyMode)
+	}
+	if restoredState.DNS.RemoteDNS != "https://dns.google/dns-query" {
+		t.Errorf("expected remote DNS https://dns.google/dns-query, got %q", restoredState.DNS.RemoteDNS)
+	}
+	if len(restoredState.SelectedUIDs) != 2 || restoredState.SelectedUIDs[0] != 10150 {
+		t.Errorf("expected UIDs [10150, 10151], got %v", restoredState.SelectedUIDs)
+	}
+	if len(restoredState.Nodes) != 1 || restoredState.Nodes[0].Name != "MyPersistentNode" {
+		t.Errorf("expected preserved nodes, got %v", restoredState.Nodes)
+	}
+
+	// Verify StateFile was recreated from backup
+	if _, err := os.Stat(StateFile); err != nil {
+		t.Errorf("expected StateFile to be restored on disk: %v", err)
+	}
+}
+
+func TestPersistentConfigBackupAndRestore(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBaseConfig := BaseConfig
+	origPersistDir := PersistDir
+	origPersistBaseConfig := PersistBaseConfig
+	defer func() {
+		BaseConfig = origBaseConfig
+		PersistDir = origPersistDir
+		PersistBaseConfig = origPersistBaseConfig
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "modules", "passwall-android", "config", "config.json")
+	PersistDir = filepath.Join(tmpDir, "persist", "passwall")
+	PersistBaseConfig = filepath.Join(PersistDir, "config.json")
+
+	customJSON := `{"log":{"loglevel":"debug"},"customKey":"customValue"}`
+	_ = os.MkdirAll(filepath.Dir(BaseConfig), 0755)
+	if err := os.WriteFile(BaseConfig, []byte(customJSON), 0644); err != nil {
+		t.Fatalf("failed to write custom base config: %v", err)
+	}
+
+	// 1. Sync persistent configs
+	syncPersistentConfigs()
+
+	// Verify PersistBaseConfig was backed up
+	data, err := os.ReadFile(PersistBaseConfig)
+	if err != nil {
+		t.Fatalf("PersistBaseConfig not created: %v", err)
+	}
+	if string(data) != customJSON {
+		t.Errorf("expected %q, got %q", customJSON, string(data))
+	}
+
+	// 2. Simulate module update wipe: delete BaseConfig
+	_ = os.Remove(BaseConfig)
+
+	// 3. syncPersistentConfigs restores BaseConfig from PersistBaseConfig
+	syncPersistentConfigs()
+	restoredData, err := os.ReadFile(BaseConfig)
+	if err != nil {
+		t.Fatalf("BaseConfig not restored: %v", err)
+	}
+	if string(restoredData) != customJSON {
+		t.Errorf("expected restored config %q, got %q", customJSON, string(restoredData))
+	}
+}

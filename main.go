@@ -36,6 +36,10 @@ var (
 	PackagesFile  = "/data/system/packages.list"
 	WebListenAddr = "127.0.0.1:9090"
 	AppVersion    = "v1.2.1"
+
+	PersistDir        = "/data/adb/passwall"
+	PersistBaseConfig = PersistDir + "/config.json"
+	PersistStateFile  = PersistDir + "/state.json"
 )
 
 const (
@@ -245,6 +249,31 @@ func detectTproxy() bool {
 		"-p", "tcp", "-j", "TPROXY", "--on-port", strconv.Itoa(TproxyPort), "--on-ip", "127.0.0.1") == nil
 }
 
+func syncPersistentConfigs() {
+	_ = os.MkdirAll(PersistDir, 0755)
+	_ = os.MkdirAll(filepath.Dir(BaseConfig), 0755)
+
+	if _, err := os.Stat(BaseConfig); os.IsNotExist(err) {
+		if data, errRead := os.ReadFile(PersistBaseConfig); errRead == nil && len(data) > 0 {
+			_ = os.WriteFile(BaseConfig, data, 0644)
+		}
+	} else if _, err := os.Stat(PersistBaseConfig); os.IsNotExist(err) {
+		if data, errRead := os.ReadFile(BaseConfig); errRead == nil && len(data) > 0 {
+			_ = os.WriteFile(PersistBaseConfig, data, 0644)
+		}
+	}
+
+	if _, err := os.Stat(StateFile); os.IsNotExist(err) {
+		if data, errRead := os.ReadFile(PersistStateFile); errRead == nil && len(data) > 0 {
+			_ = os.WriteFile(StateFile, data, 0644)
+		}
+	} else if _, err := os.Stat(PersistStateFile); os.IsNotExist(err) {
+		if data, errRead := os.ReadFile(StateFile); errRead == nil && len(data) > 0 {
+			_ = os.WriteFile(PersistStateFile, data, 0644)
+		}
+	}
+}
+
 func loadState() PanelState {
 	stateMu.Lock()
 	defer stateMu.Unlock()
@@ -255,8 +284,20 @@ func loadState() PanelState {
 		SelectedUIDs:  []int{},
 		Nodes:         []NodeProfile{},
 	}
-	if data, err := os.ReadFile(StateFile); err == nil {
-		_ = json.Unmarshal(data, &st)
+	loaded := false
+	if data, err := os.ReadFile(StateFile); err == nil && len(data) > 0 {
+		if err := json.Unmarshal(data, &st); err == nil {
+			loaded = true
+		}
+	}
+	if !loaded {
+		if data, err := os.ReadFile(PersistStateFile); err == nil && len(data) > 0 {
+			if err := json.Unmarshal(data, &st); err == nil {
+				loaded = true
+				_ = os.MkdirAll(filepath.Dir(StateFile), 0755)
+				_ = os.WriteFile(StateFile, data, 0644)
+			}
+		}
 	}
 	if st.ProxyMode != "rule" && st.ProxyMode != "global" && st.ProxyMode != "direct" {
 		st.ProxyMode = "rule"
@@ -290,7 +331,12 @@ func saveState(st PanelState) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(StateFile, data, 0644)
+	_ = os.MkdirAll(filepath.Dir(StateFile), 0755)
+	err = os.WriteFile(StateFile, data, 0644)
+	if errDir := os.MkdirAll(PersistDir, 0755); errDir == nil {
+		_ = os.WriteFile(PersistStateFile, data, 0644)
+	}
+	return err
 }
 
 func listInstalledApps() []AndroidApp {
@@ -339,7 +385,10 @@ func extractHost(target string) string {
 func prepareRuntimeConfig(tproxySupported bool) error {
 	raw, err := os.ReadFile(BaseConfig)
 	if err != nil {
-		return err
+		raw, err = os.ReadFile(PersistBaseConfig)
+	}
+	if err != nil {
+		return fmt.Errorf("read base config: %v", err)
 	}
 	var cfg map[string]interface{}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
@@ -1944,9 +1993,13 @@ func startWebDashboard() {
 			}
 			var pretty bytes.Buffer
 			_ = json.Indent(&pretty, []byte(req.RawJSON), "", "  ")
+			_ = os.MkdirAll(filepath.Dir(BaseConfig), 0755)
 			if err := os.WriteFile(BaseConfig, pretty.Bytes(), 0644); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
+			}
+			if errDir := os.MkdirAll(PersistDir, 0755); errDir == nil {
+				_ = os.WriteFile(PersistBaseConfig, pretty.Bytes(), 0644)
 			}
 			st := loadState()
 			st.ActiveNode = ""
@@ -2064,6 +2117,7 @@ func main() {
 	}
 
 	log.SetOutput(logSink)
+	syncPersistentConfigs()
 	_ = os.WriteFile(PidFile, []byte(strconv.Itoa(os.Getpid())), 0644)
 	defer os.Remove(PidFile)
 	defer os.Remove(RuntimeConfig)
