@@ -30,7 +30,7 @@ var (
 	BaseConfig    = BaseDir + "/config/config.json"
 	StateFile     = BaseDir + "/config/state.json"
 	RuntimeConfig = "/dev/passwall-xray.json"
-	AssetDir      = BaseDir + "/config"
+	AssetDir      = BaseDir + "/bin"
 	LogFile       = "/data/adb/passwall-android.log"
 	PidFile       = "/dev/passwall-droid.pid"
 	PackagesFile  = "/data/system/packages.list"
@@ -1020,6 +1020,24 @@ func cleanupIptables() {
 		"-p", "udp", "--dport", "443", "-j", "REJECT")
 }
 
+func getAssetDir() string {
+	if _, err := os.Stat(filepath.Join(AssetDir, "geoip.dat")); err == nil {
+		return AssetDir
+	}
+	binDir := filepath.Join(BaseDir, "bin")
+	if _, err := os.Stat(filepath.Join(binDir, "geoip.dat")); err == nil {
+		return binDir
+	}
+	cfgDir := filepath.Join(BaseDir, "config")
+	if _, err := os.Stat(filepath.Join(cfgDir, "geoip.dat")); err == nil {
+		return cfgDir
+	}
+	if _, err := os.Stat(filepath.Join(BaseDir, "geoip.dat")); err == nil {
+		return BaseDir
+	}
+	return AssetDir
+}
+
 func superviseXray(stopCh <-chan struct{}, doneCh chan<- struct{}) {
 	defer close(doneCh)
 	raiseFileLimits()
@@ -1032,13 +1050,14 @@ func superviseXray(stopCh <-chan struct{}, doneCh chan<- struct{}) {
 		}
 
 		log.Println("[passwall-droid] starting xray-core...")
+		assetDir := getAssetDir()
 		cmd := exec.Command(XrayBin, "run", "-c", RuntimeConfig)
-		cmd.Dir = AssetDir
+		cmd.Dir = assetDir
 		cmd.Env = append(os.Environ(),
-			"XRAY_LOCATION_ASSET="+AssetDir,
-			"xray.location.asset="+AssetDir,
-			"V2RAY_LOCATION_ASSET="+AssetDir,
-			"v2ray.location.asset="+AssetDir,
+			"XRAY_LOCATION_ASSET="+assetDir,
+			"xray.location.asset="+assetDir,
+			"V2RAY_LOCATION_ASSET="+assetDir,
+			"v2ray.location.asset="+assetDir,
 			"GOGC=40",
 			"GOMEMLIMIT=48MiB",
 		)

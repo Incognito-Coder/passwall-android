@@ -25,6 +25,7 @@ CACHE_DIR=".cache/downloads/${XRAY_VER}"
 echo "Building Passwall Android version: ${MOD_VERSION} (versionCode: ${MOD_VERSION_CODE}, author: Incognito-Coder)"
 
 rm -rf dist
+rm -f "${ZIP_NAME}" "${ZIP_NAME}.sha256"
 mkdir -p "$OUT_DIR/bin/arm" "$OUT_DIR/bin/arm64" "$OUT_DIR/config" "${CACHE_DIR}/arm" "${CACHE_DIR}/arm64" .cache/downloads
 
 # 1. Cross-compile static passwall-droid binaries (ARMv7 Android 6+ & ARM64)
@@ -62,12 +63,9 @@ if [ ! -f ".cache/downloads/geosite.dat" ]; then
   curl -fL "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geosite.dat" -o ".cache/downloads/geosite.dat"
 fi
 
-cp ".cache/downloads/geoip.dat" "$OUT_DIR/config/geoip.dat"
-cp ".cache/downloads/geosite.dat" "$OUT_DIR/config/geosite.dat"
+# Single copy in bin/ alongside the xray binary to prevent duplicate asset inflation
 cp ".cache/downloads/geoip.dat" "$OUT_DIR/bin/geoip.dat"
 cp ".cache/downloads/geosite.dat" "$OUT_DIR/bin/geosite.dat"
-cp ".cache/downloads/geoip.dat" "$OUT_DIR/geoip.dat"
-cp ".cache/downloads/geosite.dat" "$OUT_DIR/geosite.dat"
 
 # 4. Copy Magisk/KernelSU module scripts and base configuration
 cp -r module/* "$OUT_DIR/"

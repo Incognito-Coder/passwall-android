@@ -1326,3 +1326,34 @@ func TestButtonAndBadgeCSSStyles(t *testing.T) {
 		t.Errorf("expected .badge-ver in dashboardHTML")
 	}
 }
+
+func TestGetAssetDir(t *testing.T) {
+	origAsset := AssetDir
+	origBase := BaseDir
+	defer func() {
+		AssetDir = origAsset
+		BaseDir = origBase
+	}()
+
+	tmp := t.TempDir()
+	binDir := filepath.Join(tmp, "bin")
+	_ = os.MkdirAll(binDir, 0755)
+	_ = os.WriteFile(filepath.Join(binDir, "geoip.dat"), []byte("test"), 0644)
+
+	AssetDir = binDir
+	BaseDir = tmp
+
+	if dir := getAssetDir(); dir != binDir {
+		t.Errorf("expected %s, got %s", binDir, dir)
+	}
+
+	cfgDir := filepath.Join(tmp, "config")
+	_ = os.MkdirAll(cfgDir, 0755)
+	_ = os.WriteFile(filepath.Join(cfgDir, "geoip.dat"), []byte("test"), 0644)
+	AssetDir = filepath.Join(tmp, "nonexistent")
+	_ = os.Remove(filepath.Join(binDir, "geoip.dat"))
+
+	if dir := getAssetDir(); dir != cfgDir {
+		t.Errorf("expected %s, got %s", cfgDir, dir)
+	}
+}

@@ -52,6 +52,17 @@ else
   cp -f "$MODPATH/config/config.json" "$PERSIST_DIR/config.json"
 fi
 
+# --------------------------------------------------------------------------
+# Setup geoip.dat and geosite.dat ruleset symlinks
+# --------------------------------------------------------------------------
+# Clean legacy duplicate files in config/ and module root, then symlink to bin/
+rm -f "$MODPATH/config/geoip.dat" "$MODPATH/config/geosite.dat"
+rm -f "$MODPATH/geoip.dat" "$MODPATH/geosite.dat"
+ln -sf "$MODPATH/bin/geoip.dat" "$MODPATH/config/geoip.dat"
+ln -sf "$MODPATH/bin/geosite.dat" "$MODPATH/config/geosite.dat"
+ln -sf "$MODPATH/bin/geoip.dat" "$MODPATH/geoip.dat"
+ln -sf "$MODPATH/bin/geosite.dat" "$MODPATH/geosite.dat"
+
 mkdir -p "$MODPATH/system/bin"
 cat << 'CLI' > "$MODPATH/system/bin/passwall"
 #!/system/bin/sh
