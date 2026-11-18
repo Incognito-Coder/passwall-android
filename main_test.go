@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -845,5 +846,240 @@ func TestPersistentConfigBackupAndRestore(t *testing.T) {
 	}
 	if string(restoredData) != customJSON {
 		t.Errorf("expected restored config %q, got %q", customJSON, string(restoredData))
+	}
+}
+
+func TestLocalhostProxyStateDefaultAndToggle(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersistState := PersistStateFile
+	origBaseDir := BaseDir
+	defer func() {
+		StateFile = origState
+		PersistStateFile = origPersistState
+		BaseDir = origBaseDir
+	}()
+
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+	BaseDir = tmpDir
+
+	// 1. Initial state defaults to LocalhostProxy = true
+	st := loadState()
+	if !st.LocalhostProxy {
+		t.Errorf("expected LocalhostProxy default to be true, got false")
+	}
+
+	// 2. Set LocalhostProxy = false and save
+	st.LocalhostProxy = false
+	if err := saveState(st); err != nil {
+		t.Fatalf("saveState failed: %v", err)
+	}
+
+	// 3. Reload state and verify LocalhostProxy is false
+	reloaded := loadState()
+	if reloaded.LocalhostProxy {
+		t.Errorf("expected LocalhostProxy to be false after save, got true")
+	}
+
+	// 4. Toggle back to true and verify
+	reloaded.LocalhostProxy = true
+	if err := saveState(reloaded); err != nil {
+		t.Fatalf("saveState failed: %v", err)
+	}
+	reloaded2 := loadState()
+	if !reloaded2.LocalhostProxy {
+		t.Errorf("expected LocalhostProxy to be true after toggle back, got false")
+	}
+}
+
+func TestPrepareRuntimeConfigSocksInbound(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBase := BaseConfig
+	origRuntime := RuntimeConfig
+	origState := StateFile
+	origPersistBase := PersistBaseConfig
+	origPersistState := PersistStateFile
+	defer func() {
+		BaseConfig = origBase
+		RuntimeConfig = origRuntime
+		StateFile = origState
+		PersistBaseConfig = origPersistBase
+		PersistStateFile = origPersistState
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistBaseConfig = filepath.Join(tmpDir, "persist_config.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+
+	// Config without socks-in inbound
+	baseJSON := `{
+		"inbounds": [
+			{"tag": "tproxy-in", "listen": "0.0.0.0", "port": 12345, "protocol": "dokodemo-door"}
+		],
+		"outbounds": [
+			{"tag": "direct", "protocol": "freedom"}
+		]
+	}`
+	if err := os.WriteFile(BaseConfig, []byte(baseJSON), 0644); err != nil {
+		t.Fatalf("failed to write base config: %v", err)
+	}
+
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig failed: %v", err)
+	}
+
+	data, err := os.ReadFile(RuntimeConfig)
+	if err != nil {
+		t.Fatalf("failed to read runtime config: %v", err)
+	}
+
+	var generated map[string]interface{}
+	if err := json.Unmarshal(data, &generated); err != nil {
+		t.Fatalf("invalid runtime json: %v", err)
+	}
+
+	inbounds, ok := generated["inbounds"].([]interface{})
+	if !ok {
+		t.Fatalf("expected inbounds array in generated config")
+	}
+
+	hasSocks := false
+	for _, item := range inbounds {
+		if inb, ok := item.(map[string]interface{}); ok {
+			if tag, _ := inb["tag"].(string); tag == "socks-in" {
+				hasSocks = true
+				if inb["listen"] != "127.0.0.1" || int(inb["port"].(float64)) != 10808 {
+					t.Errorf("socks-in config mismatch: listen=%v port=%v", inb["listen"], inb["port"])
+				}
+			}
+		}
+	}
+	if !hasSocks {
+		t.Errorf("expected socks-in inbound to be added to generated runtime config")
+	}
+}
+
+func TestCheckTargetConnectivity(t *testing.T) {
+	// 1. Mock server returning 204 No Content
+	mock204 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer mock204.Close()
+
+	client := mock204.Client()
+	status204 := checkTargetConnectivity(client, mock204.URL)
+	if !status204.Reachable {
+		t.Errorf("expected 204 target to be reachable, got false (status: %s)", status204.Status)
+	}
+	if status204.LatencyMs <= 0 {
+		t.Errorf("expected positive latency, got %d", status204.LatencyMs)
+	}
+
+	// 2. Mock server returning 200 OK
+	mock200 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer mock200.Close()
+
+	status200 := checkTargetConnectivity(client, mock200.URL)
+	if !status200.Reachable {
+		t.Errorf("expected 200 target to be reachable, got false")
+	}
+
+	// 3. Mock server returning 500 Internal Server Error
+	mock500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer mock500.Close()
+
+	status500 := checkTargetConnectivity(client, mock500.URL)
+	if status500.Reachable {
+		t.Errorf("expected 500 target to NOT be reachable, got reachable: true")
+	}
+
+	// 4. Invalid unreachable URL
+	statusErr := checkTargetConnectivity(client, "http://127.0.0.1:54321/unreachable")
+	if statusErr.Reachable {
+		t.Errorf("expected unreachable target to return reachable: false")
+	}
+}
+
+func TestApiLocalhostProxyAndConnectivityEndpoints(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersistState := PersistStateFile
+	defer func() {
+		StateFile = origState
+		PersistStateFile = origPersistState
+	}()
+
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+
+	// 1. Initial status includes localhost_proxy: true
+	reqStatus := httptest.NewRequest("GET", "/api/status", nil)
+	recStatus := httptest.NewRecorder()
+
+	statusHandler := func(w http.ResponseWriter, r *http.Request) {
+		st := loadState()
+		resp := map[string]interface{}{
+			"running":         false,
+			"localhost_proxy": st.LocalhostProxy,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
+
+	statusHandler(recStatus, reqStatus)
+	var statusRes map[string]interface{}
+	if err := json.Unmarshal(recStatus.Body.Bytes(), &statusRes); err != nil {
+		t.Fatalf("failed to decode status response: %v", err)
+	}
+	if statusRes["localhost_proxy"] != true {
+		t.Errorf("expected localhost_proxy true, got %v", statusRes["localhost_proxy"])
+	}
+
+	// 2. POST /api/localhost_proxy to set it to false
+	toggleBody := bytes.NewBufferString(`{"localhost_proxy":false}`)
+	reqToggle := httptest.NewRequest("POST", "/api/localhost_proxy", toggleBody)
+	recToggle := httptest.NewRecorder()
+
+	toggleHandler := func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			LocalhostProxy bool `json:"localhost_proxy"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		st := loadState()
+		st.LocalhostProxy = req.LocalhostProxy
+		_ = saveState(st)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+
+	toggleHandler(recToggle, reqToggle)
+	if recToggle.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", recToggle.Code)
+	}
+
+	// Verify state saved on disk
+	st := loadState()
+	if st.LocalhostProxy != false {
+		t.Errorf("expected state LocalhostProxy to be false, got true")
+	}
+
+	// 3. GET /api/connectivity when stopped returns stopped status
+	connRes := checkConnectivity()
+	if connRes.Google.Reachable || connRes.Github.Reachable {
+		t.Errorf("expected connectivity to be false when engine stopped, got %v", connRes)
+	}
+	if connRes.Google.Status != "Proxy stopped" {
+		t.Errorf("expected status 'Proxy stopped', got %q", connRes.Google.Status)
 	}
 }

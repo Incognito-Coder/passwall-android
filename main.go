@@ -90,8 +90,20 @@ type PanelState struct {
 	LastSubUpdate   string        `json:"last_sub_update"`
 	AppFilterMode   string        `json:"app_filter_mode"` // "bypass" or "proxy"
 	SelectedUIDs    []int         `json:"selected_uids"`
+	LocalhostProxy  bool          `json:"localhost_proxy"`   // Proxy local device (default true)
 	DNS             DNSConfig     `json:"dns"`
 	Nodes           []NodeProfile `json:"nodes"`
+}
+
+type TargetStatus struct {
+	Reachable bool   `json:"reachable"`
+	LatencyMs int    `json:"latency_ms"`
+	Status    string `json:"status,omitempty"`
+}
+
+type ConnectivityStatus struct {
+	Google TargetStatus `json:"google"`
+	Github TargetStatus `json:"github"`
 }
 
 type AndroidApp struct {
@@ -279,10 +291,11 @@ func loadState() PanelState {
 	defer stateMu.Unlock()
 
 	st := PanelState{
-		ProxyMode:     "rule",
-		AppFilterMode: "bypass",
-		SelectedUIDs:  []int{},
-		Nodes:         []NodeProfile{},
+		ProxyMode:      "rule",
+		AppFilterMode:  "bypass",
+		LocalhostProxy: true,
+		SelectedUIDs:   []int{},
+		Nodes:          []NodeProfile{},
 	}
 	loaded := false
 	if data, err := os.ReadFile(StateFile); err == nil && len(data) > 0 {
@@ -500,10 +513,14 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 	}
 
 	if inbounds, ok := cfg["inbounds"].([]interface{}); ok {
+		hasSocks := false
 		for _, item := range inbounds {
 			inb, ok := item.(map[string]interface{})
 			if !ok {
 				continue
+			}
+			if tag, _ := inb["tag"].(string); tag == "socks-in" {
+				hasSocks = true
 			}
 			if tag, _ := inb["tag"].(string); tag == "tproxy-in" {
 				inb["listen"] = "0.0.0.0"
@@ -523,6 +540,22 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 					sockopt["tproxy"] = "redirect"
 				}
 			}
+		}
+		if !hasSocks {
+			cfg["inbounds"] = append(inbounds, map[string]interface{}{
+				"tag":      "socks-in",
+				"listen":   "127.0.0.1",
+				"port":     10808,
+				"protocol": "socks",
+				"settings": map[string]interface{}{
+					"auth": "noauth",
+					"udp":  true,
+				},
+				"sniffing": map[string]interface{}{
+					"enabled":      true,
+					"destOverride": []string{"http", "tls"},
+				},
+			})
 		}
 	}
 
@@ -765,21 +798,10 @@ func setupTproxyIptables() error {
 		_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_PRE",
 			"-p", proto, "--dport", "53",
 			"-j", "TPROXY", "--on-port", tproxyTarget, "--on-ip", "127.0.0.1", "--tproxy-mark", markSpec)
-
-		_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
-			"-p", proto, "--dport", "53",
-			"-j", "MARK", "--set-xmark", markSpec)
 	}
 
 	for _, cidr := range bypassCIDRsV4 {
 		_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_PRE", "-d", cidr, "-j", "RETURN")
-		_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT", "-d", cidr, "-j", "RETURN")
-	}
-
-	if BlockQUIC {
-		_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "udp", "--dport", "443", "-j", "DROP")
-		_ = runCmd("iptables", "-I", "OUTPUT", "1", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
-			"-p", "udp", "--dport", "443", "-j", "REJECT")
 	}
 
 	for _, proto := range []string{"tcp", "udp"} {
@@ -790,25 +812,46 @@ func setupTproxyIptables() error {
 		}
 	}
 
-	if st.AppFilterMode == "proxy" {
-		for _, uid := range st.SelectedUIDs {
-			uidStr := strconv.Itoa(uid)
-			for _, proto := range []string{"tcp", "udp"} {
-				_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
-					"-m", "owner", "--uid-owner", uidStr,
-					"-p", proto, "-j", "MARK", "--set-xmark", markSpec)
-			}
-		}
+	if !st.LocalhostProxy {
+		_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT", "-j", "RETURN")
 	} else {
-		for _, uid := range st.SelectedUIDs {
-			_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
-				"-m", "owner", "--uid-owner", strconv.Itoa(uid), "-j", "RETURN")
-		}
 		for _, proto := range []string{"tcp", "udp"} {
-			if err := runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
-				"-p", proto, "-j", "MARK", "--set-xmark", markSpec); err != nil {
-				return err
+			_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
+				"-p", proto, "--dport", "53",
+				"-j", "MARK", "--set-xmark", markSpec)
+		}
+		for _, cidr := range bypassCIDRsV4 {
+			_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT", "-d", cidr, "-j", "RETURN")
+		}
+
+		if st.AppFilterMode == "proxy" {
+			for _, uid := range st.SelectedUIDs {
+				uidStr := strconv.Itoa(uid)
+				for _, proto := range []string{"tcp", "udp"} {
+					_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
+						"-m", "owner", "--uid-owner", uidStr,
+						"-p", proto, "-j", "MARK", "--set-xmark", markSpec)
+				}
 			}
+		} else {
+			for _, uid := range st.SelectedUIDs {
+				_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
+					"-m", "owner", "--uid-owner", strconv.Itoa(uid), "-j", "RETURN")
+			}
+			for _, proto := range []string{"tcp", "udp"} {
+				if err := runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
+					"-p", proto, "-j", "MARK", "--set-xmark", markSpec); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	if BlockQUIC {
+		_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "udp", "--dport", "443", "-j", "DROP")
+		if st.LocalhostProxy {
+			_ = runCmd("iptables", "-I", "OUTPUT", "1", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+				"-p", "udp", "--dport", "443", "-j", "REJECT")
 		}
 	}
 
@@ -854,19 +897,18 @@ func setupRedirectIptables() error {
 	for _, proto := range []string{"udp", "tcp"} {
 		_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_PRE",
 			"-p", proto, "--dport", "53", "-j", "REDIRECT", "--to-ports", redirPort)
-		_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT",
-			"-p", proto, "--dport", "53", "-j", "REDIRECT", "--to-ports", redirPort)
 	}
 
 	for _, cidr := range bypassCIDRsV4 {
 		_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_PRE", "-d", cidr, "-j", "RETURN")
-		_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT", "-d", cidr, "-j", "RETURN")
 	}
 
 	if BlockQUIC {
 		_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "udp", "--dport", "443", "-j", "DROP")
-		_ = runCmd("iptables", "-I", "OUTPUT", "1", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
-			"-p", "udp", "--dport", "443", "-j", "REJECT")
+		if st.LocalhostProxy {
+			_ = runCmd("iptables", "-I", "OUTPUT", "1", "-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+				"-p", "udp", "--dport", "443", "-j", "REJECT")
+		}
 	}
 
 	if err := runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_PRE",
@@ -874,20 +916,32 @@ func setupRedirectIptables() error {
 		return err
 	}
 
-	if st.AppFilterMode == "proxy" {
-		for _, uid := range st.SelectedUIDs {
-			_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT",
-				"-m", "owner", "--uid-owner", strconv.Itoa(uid),
-				"-p", "tcp", "-j", "REDIRECT", "--to-ports", redirPort)
-		}
+	if !st.LocalhostProxy {
+		_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT", "-j", "RETURN")
 	} else {
-		for _, uid := range st.SelectedUIDs {
+		for _, proto := range []string{"udp", "tcp"} {
 			_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT",
-				"-m", "owner", "--uid-owner", strconv.Itoa(uid), "-j", "RETURN")
+				"-p", proto, "--dport", "53", "-j", "REDIRECT", "--to-ports", redirPort)
 		}
-		if err := runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT",
-			"-p", "tcp", "-j", "REDIRECT", "--to-ports", redirPort); err != nil {
-			return err
+		for _, cidr := range bypassCIDRsV4 {
+			_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT", "-d", cidr, "-j", "RETURN")
+		}
+
+		if st.AppFilterMode == "proxy" {
+			for _, uid := range st.SelectedUIDs {
+				_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT",
+					"-m", "owner", "--uid-owner", strconv.Itoa(uid),
+					"-p", "tcp", "-j", "REDIRECT", "--to-ports", redirPort)
+			}
+		} else {
+			for _, uid := range st.SelectedUIDs {
+				_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT",
+					"-m", "owner", "--uid-owner", strconv.Itoa(uid), "-j", "RETURN")
+			}
+			if err := runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT",
+				"-p", "tcp", "-j", "REDIRECT", "--to-ports", redirPort); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1708,6 +1762,80 @@ func pingNodes(targetID string, selectFastest bool) {
 	}
 }
 
+func checkTargetConnectivity(client *http.Client, targetURL string) TargetStatus {
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return TargetStatus{Reachable: false, LatencyMs: -1, Status: err.Error()}
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return TargetStatus{Reachable: false, LatencyMs: -1, Status: "Connection error"}
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+
+	ms := int(time.Since(start).Milliseconds())
+	if ms < 1 {
+		ms = 1
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+		return TargetStatus{Reachable: true, LatencyMs: ms, Status: fmt.Sprintf("%d OK", resp.StatusCode)}
+	}
+	return TargetStatus{Reachable: false, LatencyMs: ms, Status: fmt.Sprintf("HTTP %d", resp.StatusCode)}
+}
+
+func checkConnectivity() ConnectivityStatus {
+	engineMu.Lock()
+	active := engineActive
+	engineMu.Unlock()
+
+	if !active {
+		return ConnectivityStatus{
+			Google: TargetStatus{Reachable: false, LatencyMs: -1, Status: "Proxy stopped"},
+			Github: TargetStatus{Reachable: false, LatencyMs: -1, Status: "Proxy stopped"},
+		}
+	}
+
+	proxyURL, err := url.Parse("socks5://127.0.0.1:10808")
+	var transport *http.Transport
+	if err == nil {
+		transport = &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+			DisableKeepAlives: true,
+		}
+	} else {
+		transport = &http.Transport{
+			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+			DisableKeepAlives: true,
+		}
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   6 * time.Second,
+	}
+
+	var res ConnectivityStatus
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		res.Google = checkTargetConnectivity(client, "https://www.google.com/generate_204")
+	}()
+	go func() {
+		defer wg.Done()
+		res.Github = checkTargetConnectivity(client, "https://github.com")
+	}()
+	wg.Wait()
+	return res
+}
+
 func startWebDashboard() {
 	mux := http.NewServeMux()
 
@@ -1739,6 +1867,7 @@ func startWebDashboard() {
 			"last_sub_update":   st.LastSubUpdate,
 			"app_filter_mode":   st.AppFilterMode,
 			"selected_uids":     st.SelectedUIDs,
+			"localhost_proxy":   st.LocalhostProxy,
 			"dns":               st.DNS,
 			"module_version":    getModuleVersion(),
 			"xray_version":      getXrayVersion(),
@@ -1797,6 +1926,34 @@ func startWebDashboard() {
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("/api/localhost_proxy", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			LocalhostProxy bool `json:"localhost_proxy"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		st := loadState()
+		st.LocalhostProxy = req.LocalhostProxy
+		_ = saveState(st)
+		log.Printf("[passwall-droid] localhost proxy set to %v", req.LocalhostProxy)
+		_ = restartProxyEngine()
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("/api/connectivity", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		res := checkConnectivity()
+		_ = json.NewEncoder(w).Encode(res)
 	})
 
 	mux.HandleFunc("/api/dns", func(w http.ResponseWriter, r *http.Request) {
@@ -2148,35 +2305,41 @@ const dashboardHTML = `<!DOCTYPE html>
 <title>Passwall Android</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;padding:10px;line-height:1.4}
+body{font-family:-apple-system,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;padding:8px;line-height:1.4}
 .card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px;margin-bottom:10px}
-.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.title{font-size:16px;font-weight:700;color:#f8fafc}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px}
+.title{font-size:15px;font-weight:700;color:#f8fafc}
 .badge{padding:3px 9px;border-radius:12px;font-size:11px;font-weight:700}
 .on{background:#065f46;color:#6ee7b7}
 .off{background:#7f1d1d;color:#fca5a5}
-.meta{font-size:12px;color:#94a3b8;margin-bottom:8px}
+.meta{font-size:12px;color:#94a3b8;margin-bottom:8px;word-break:break-all}
 .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-button{border:none;border-radius:7px;padding:8px 11px;font-size:12px;font-weight:600;cursor:pointer;color:#fff;background:#334155}
+button{border:none;border-radius:7px;padding:8px 11px;font-size:12px;font-weight:600;cursor:pointer;color:#fff;background:#334155;-webkit-tap-highlight-color:transparent}
 button:active{opacity:.8}
 .btn-green{background:#059669}
 .btn-red{background:#dc2626}
 .btn-blue{background:#2563eb}
 .btn-amber{background:#d97706}
 .btn-active{background:#0284c7;box-shadow:0 0 0 2px #38bdf8}
-.tabs{display:flex;gap:5px;margin-bottom:10px}
-.tab{flex:1;text-align:center;padding:8px 4px;background:#1e293b;border:1px solid #334155;border-radius:8px;font-size:12px;font-weight:600;color:#94a3b8}
+.tabs{display:flex;gap:6px;margin-bottom:10px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-bottom:3px}
+.tabs::-webkit-scrollbar{display:none}
+.tab{flex:0 0 auto;text-align:center;padding:8px 13px;background:#1e293b;border:1px solid #334155;border-radius:8px;font-size:12px;font-weight:600;color:#94a3b8;cursor:pointer;white-space:nowrap;user-select:none;-webkit-user-select:none}
 .tab.active{background:#2563eb;color:#fff;border-color:#2563eb}
 input,select,textarea{width:100%;background:#0f172a;border:1px solid #334155;border-radius:7px;color:#f8fafc;padding:8px;font-size:13px;margin-bottom:8px}
 textarea{font-family:monospace;font-size:12px;min-height:220px}
-.node-item{display:flex;justify-content:space-between;align-items:center;background:#0f172a;border:1px solid #334155;border-radius:7px;padding:8px;margin-bottom:6px}
+.node-item{display:flex;justify-content:space-between;align-items:center;background:#0f172a;border:1px solid #334155;border-radius:7px;padding:8px;margin-bottom:6px;flex-wrap:wrap;gap:6px}
 .node-item.selected{border-color:#38bdf8;background:#0c4a6e}
-.node-info{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:58%}
+.node-info{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 170px;min-width:0}
 .node-sub{font-size:11px;color:#94a3b8}
 .lat{font-size:11px;font-weight:700;padding:2px 6px;border-radius:5px;background:#1e293b}
 .lat-ok{color:#34d399}
 .lat-slow{color:#fbbf24}
 .lat-err{color:#f87171}
+.conn-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:6px 0 8px}
+.conn-pill{font-size:11px;font-weight:600;padding:3px 8px;border-radius:12px;background:#334155;color:#94a3b8;display:inline-flex;align-items:center}
+.conn-ok{background:#065f46;color:#6ee7b7}
+.conn-err{background:#7f1d1d;color:#fca5a5}
+.conn-wait{background:#854d0e;color:#fde047}
 .app-list{max-height:300px;overflow-y:auto;border:1px solid #334155;border-radius:7px;background:#0f172a;padding:6px;margin-bottom:8px}
 .app-row{display:flex;justify-content:space-between;align-items:center;padding:6px 4px;border-bottom:1px solid #1e293b;font-size:12px}
 .app-row input[type=checkbox]{width:18px;height:18px;margin:0}
@@ -2196,20 +2359,32 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
     <span id="statusBadge" class="badge off">LOADING</span>
   </div>
   <div class="meta" id="metaLine">Xray: -- | Netfilter: -- | PID: --</div>
+  <div class="conn-bar">
+    <span style="font-size:12px;color:#94a3b8;font-weight:600">Connectivity:</span>
+    <span id="connGoogle" class="conn-pill">Google: --</span>
+    <span id="connGithub" class="conn-pill">GitHub: --</span>
+    <button id="btnCheckConn" style="padding:3px 9px;font-size:11px" onclick="checkConn()">Check</button>
+  </div>
   <div class="row">
-    <button class="btn-green" onclick="ctrl('start')">Start</button>
-    <button class="btn-blue" onclick="ctrl('restart')">Restart</button>
-    <button class="btn-red" onclick="ctrl('stop')">Stop</button>
+    <button class="btn-green" style="flex:1" onclick="ctrl('start')">Start</button>
+    <button class="btn-blue" style="flex:1" onclick="ctrl('restart')">Restart</button>
+    <button class="btn-red" style="flex:1" onclick="ctrl('stop')">Stop</button>
   </div>
   <div class="msg" id="toast"></div>
 </div>
 
 <div class="card">
   <div class="title" style="font-size:13px;margin-bottom:6px">Routing Mode</div>
-  <div class="row">
-    <button id="mode-rule" onclick="setMode('rule')">Rule (Bypass IR/LAN)</button>
-    <button id="mode-global" onclick="setMode('global')">Global</button>
-    <button id="mode-direct" onclick="setMode('direct')">Direct</button>
+  <div class="row" style="margin-bottom:8px">
+    <button id="mode-rule" style="flex:1" onclick="setMode('rule')">Rule (Bypass IR/LAN)</button>
+    <button id="mode-global" style="flex:1" onclick="setMode('global')">Global</button>
+    <button id="mode-direct" style="flex:1" onclick="setMode('direct')">Direct</button>
+  </div>
+  <div style="border-top:1px solid #334155;padding-top:8px;margin-top:8px">
+    <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;color:#cbd5e1;cursor:pointer">
+      <input id="localhostProxyChk" type="checkbox" style="width:18px;height:18px;margin:2px 0 0 0" onchange="toggleLocalhostProxy(this.checked)">
+      <span><b>Proxy Local Device (Localhost)</b><span class="node-sub" style="display:block">Uncheck to proxy only hotspot/tethered clients while phone apps route direct WAN.</span></span>
+    </label>
   </div>
 </div>
 
@@ -2320,6 +2495,8 @@ var cachedApps = [];
 var selectedUIDMap = {};
 var subInitialized = false;
 var dnsInitialized = false;
+var checkingConn = false;
+var connCheckedOnce = false;
 
 function req(method, url, body, cb) {
   var xhr = new XMLHttpRequest();
@@ -2381,6 +2558,58 @@ function saveDNS() {
   });
 }
 
+function checkConn() {
+  if (checkingConn) { return; }
+  checkingConn = true;
+  var gEl = document.getElementById("connGoogle");
+  var ghEl = document.getElementById("connGithub");
+  var btn = document.getElementById("btnCheckConn");
+  if (gEl) { gEl.className = "conn-pill conn-wait"; gEl.innerHTML = "Google: ..."; }
+  if (ghEl) { ghEl.className = "conn-pill conn-wait"; ghEl.innerHTML = "GitHub: ..."; }
+  if (btn) { btn.disabled = true; }
+
+  req("GET", "/api/connectivity", null, function(code, text) {
+    checkingConn = false;
+    if (btn) { btn.disabled = false; }
+    if (code !== 200) {
+      if (gEl) { gEl.className = "conn-pill conn-err"; gEl.innerHTML = "Google: Fail"; }
+      if (ghEl) { ghEl.className = "conn-pill conn-err"; ghEl.innerHTML = "GitHub: Fail"; }
+      return;
+    }
+    var res = JSON.parse(text);
+    if (gEl) {
+      if (res.google && res.google.reachable) {
+        gEl.className = "conn-pill conn-ok";
+        gEl.innerHTML = "Google: " + res.google.latency_ms + "ms";
+      } else {
+        gEl.className = "conn-pill conn-err";
+        gEl.innerHTML = "Google: " + ((res.google && res.google.status) || "Fail");
+      }
+    }
+    if (ghEl) {
+      if (res.github && res.github.reachable) {
+        ghEl.className = "conn-pill conn-ok";
+        ghEl.innerHTML = "GitHub: " + res.github.latency_ms + "ms";
+      } else {
+        ghEl.className = "conn-pill conn-err";
+        ghEl.innerHTML = "GitHub: " + ((res.github && res.github.status) || "Fail");
+      }
+    }
+  });
+}
+
+function toggleLocalhostProxy(checked) {
+  showMsg((checked ? "Enabling" : "Disabling") + " localhost proxy...");
+  req("POST", "/api/localhost_proxy", {localhost_proxy: checked}, function(code, text) {
+    if (code === 200) {
+      showMsg("Localhost proxy " + (checked ? "enabled." : "disabled."));
+      refreshStatus();
+    } else {
+      showMsg("Error setting localhost proxy: " + text);
+    }
+  });
+}
+
 function refreshStatus() {
   req("GET", "/api/status", null, function(code, text) {
     if (code !== 200) { return; }
@@ -2391,6 +2620,21 @@ function refreshStatus() {
     document.getElementById("modVerBadge").innerHTML = esc(d.module_version || "v1.2.1");
     document.getElementById("metaLine").innerHTML =
       "Xray: " + esc(d.xray_version || "Unknown") + " | Netfilter: " + esc(d.net_mode) + " | PID: " + d.daemon_pid;
+
+    var chk = document.getElementById("localhostProxyChk");
+    if (chk) {
+      chk.checked = (d.localhost_proxy !== false);
+    }
+
+    if (d.running && !connCheckedOnce) {
+      connCheckedOnce = true;
+      checkConn();
+    } else if (!d.running) {
+      var gEl = document.getElementById("connGoogle");
+      var ghEl = document.getElementById("connGithub");
+      if (gEl) { gEl.className = "conn-pill"; gEl.innerHTML = "Google: Stopped"; }
+      if (ghEl) { ghEl.className = "conn-pill"; ghEl.innerHTML = "GitHub: Stopped"; }
+    }
 
     var modes = ["rule", "global", "direct"];
     for (var i = 0; i < modes.length; i++) {
@@ -2602,3 +2846,4 @@ setInterval(function() {
 </body>
 </html>
 `
+
