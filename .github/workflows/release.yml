@@ -13,6 +13,14 @@ on:
         description: 'Optional Xray-core tag (leave empty for latest)'
         required: false
         default: ''
+      module_version:
+        description: 'Optional module version (e.g. v1.2.1, leave empty to auto-derive from tag/branch)'
+        required: false
+        default: ''
+      module_version_code:
+        description: 'Optional module versionCode (e.g. 121, leave empty to auto-derive)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -23,6 +31,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -39,7 +49,9 @@ jobs:
           if [ -n "$INPUT_VER" ]; then
             TAG="$INPUT_VER"
           else
-            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN"               "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=1"               | jq -r '.[0].tag_name // empty')
+            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=1" \
+              | jq -r '.[0].tag_name // empty')
           fi
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
             TAG="v26.11.9"
@@ -65,15 +77,33 @@ jobs:
         if: steps.check_rel.outputs.skip != 'true'
         env:
           XRAY_VER: ${{ steps.xray.outputs.tag }}
+          INPUT_MOD_VER: ${{ github.event.inputs.module_version }}
+          INPUT_MOD_CODE: ${{ github.event.inputs.module_version_code }}
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          if [ -n "$INPUT_MOD_VER" ]; then
+            MOD_VER="$INPUT_MOD_VER"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             MOD_VER="${GITHUB_REF_NAME}"
           else
             MOD_VER="v1.2.0-${XRAY_VER}"
           fi
+
+          if [ -n "$INPUT_MOD_CODE" ]; then
+            MOD_CODE="$INPUT_MOD_CODE"
+          elif [[ "${MOD_VER}" =~ ^v?([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[4]:-0}"
+            MOD_CODE=$(( 10#$MAJOR * 100 + 10#$MINOR * 10 + 10#$PATCH ))
+          else
+            MOD_CODE=$(grep -E '^versionCode=' module/module.prop | cut -d= -f2 || echo 120)
+          fi
+
           echo "MOD_VER=${MOD_VER}" >> "$GITHUB_ENV"
+          echo "MOD_CODE=${MOD_CODE}" >> "$GITHUB_ENV"
+          echo "Building module version: ${MOD_VER} (versionCode: ${MOD_CODE})..."
           chmod +x build.sh
-          MOD_VERSION="${MOD_VER}" ./build.sh
+          ./build.sh "${MOD_VER}" "${MOD_CODE}" "${XRAY_VER}"
           sha256sum "passwall-android-${MOD_VER}-universal.zip" > "passwall-android-${MOD_VER}-universal.zip.sha256"
 
       - name: Publish GitHub Release

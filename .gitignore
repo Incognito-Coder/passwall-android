@@ -1,6 +1,8 @@
 # Build and distribution artifacts
 dist/
 tmp_dl/
+tmp_ext/
+.cache/
 *.zip
 *.sha256
 
