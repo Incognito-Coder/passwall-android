@@ -3821,8 +3821,9 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;border-radius:7p
 .app-row input[type=checkbox]{width:18px;height:18px;margin:0}
 pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;font-size:11px;color:#cbd5e1;overflow-x:auto;max-height:320px;white-space:pre-wrap;word-break:break-all}
 .msg{font-size:12px;color:#38bdf8;margin-top:6px;min-height:16px}
-.hidden{display:none}
+.hidden{display:none !important}
 .modal-bg{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:999;padding:12px}
+.modal-bg.hidden{display:none !important}
 .modal-card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px;width:100%;max-width:440px;box-sizing:border-box}
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:10px}
 .stat-box{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px}
@@ -4096,11 +4097,11 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
   <pre id="logBox">Loading logs...</pre>
 </div>
 
-<div id="nodeEditModal" class="modal-bg hidden">
+<div id="nodeEditModal" class="modal-bg hidden" style="display:none" onclick="if(event.target===this)closeEditNode()">
   <div class="modal-card">
     <div class="header" style="margin-bottom:10px">
       <div class="title" style="font-size:14px">Edit Proxy Node</div>
-      <button class="btn-sm" onclick="closeEditNode()">✕</button>
+      <button class="btn-sm" type="button" onclick="closeEditNode()">✕</button>
     </div>
     <input type="hidden" id="editNodeId">
     <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Node Name</div>
@@ -4114,8 +4115,8 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
     <div style="font-size:12px;font-weight:600;margin:6px 0 4px;color:#cbd5e1">Replace from Share URI (Optional)</div>
     <input id="editNodeURI" type="text" placeholder="vless://... or trojan://... (optional)">
     <div class="row" style="margin-top:10px">
-      <button class="btn-green" style="flex:1" onclick="saveEditNode()">Save Changes</button>
-      <button style="flex:1" onclick="closeEditNode()">Cancel</button>
+      <button class="btn-green" style="flex:1" type="button" onclick="saveEditNode()">Save Changes</button>
+      <button style="flex:1" type="button" onclick="closeEditNode()">Cancel</button>
     </div>
   </div>
 </div>
@@ -4686,11 +4687,15 @@ function openEditNode(id) {
     }
   }
   document.getElementById("editNodeSNI").value = sni;
-  document.getElementById("nodeEditModal").className = "modal-bg";
+  var m = document.getElementById("nodeEditModal");
+  m.className = "modal-bg";
+  m.style.display = "flex";
 }
 
 function closeEditNode() {
-  document.getElementById("nodeEditModal").className = "modal-bg hidden";
+  var m = document.getElementById("nodeEditModal");
+  m.className = "modal-bg hidden";
+  m.style.display = "none";
 }
 
 function saveEditNode() {
@@ -4739,6 +4744,9 @@ document.addEventListener("visibilitychange", function() {
     if (document.getElementById("p-logs").className === "card") { loadLogs(); }
   }
   schedulePoll();
+});
+window.addEventListener("keydown", function(e) {
+  if (e.key === "Escape") { closeEditNode(); }
 });
 
 refreshStatus();
