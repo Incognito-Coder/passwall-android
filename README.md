@@ -15,6 +15,7 @@ OpenWrt Passwall-style transparent proxy module for Android 6.0 through Android 
 - **Embedded Web Control Panel (`http://127.0.0.1:9090` or `http://<phone-ip>:9090` on LAN):**
   - Switch routing modes (`Rule`, `Global`, `Direct`) with deadlock-free domain resolution for proxy nodes.
   - Dedicated **DNS Settings** tab: configure Remote DNS (`tcp://1.1.1.1`, `https://dns.google/dns-query`, etc.), Direct DNS (`223.5.5.5`, `10.202.10.202`, etc.), and Query Strategy (`UseIPv4`, `UseIP`, `UseIPv6`).
+  - Dedicated **Geo Rules Settings** tab: toggle domestic bypass (Iran / China), ad-blocking (`geosite:category-ads-all`), configure custom Direct, Proxy, and Block domain & IP lists, inspect `geoip.dat` and `geosite.dat` status, and update geo assets on-the-fly over direct WAN.
   - Import `vless://` (including `xhttp`, `ws`, `grpc`, `tls`, `reality`), `trojan://`, `vmess://`, `ss://`, and `hysteria2://` / `hy2://` links.
   - Fetch Base64/plain subscription URLs over direct WAN (`SO_MARK 0x02000000`) with optional SSL/TLS certificate verification bypass and scheduled background auto-updates.
   - Concurrent TCP/TLS latency tester with one-tap **Fastest** node selection.
@@ -44,6 +45,7 @@ su -c passwall status
 su -c passwall stop
 su -c passwall start
 su -c passwall reset-config
+su -c passwall update-geo
 ```
 
 ## Author

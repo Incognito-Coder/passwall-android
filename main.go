@@ -210,6 +210,57 @@ type DNSConfig struct {
 	QueryStrategy string `json:"query_strategy"` // "UseIPv4", "UseIP", "UseIPv6"
 }
 
+type GeoConfig struct {
+	BypassIran    *bool    `json:"bypass_iran,omitempty"`
+	BypassCN      *bool    `json:"bypass_cn,omitempty"`
+	BlockAds      *bool    `json:"block_ads,omitempty"`
+	DirectDomains []string `json:"direct_domains"`
+	DirectIPs     []string `json:"direct_ips"`
+	ProxyDomains  []string `json:"proxy_domains"`
+	ProxyIPs      []string `json:"proxy_ips"`
+	BlockDomains  []string `json:"block_domains"`
+	BlockIPs      []string `json:"block_ips"`
+	GeoIPURL      string   `json:"geoip_url"`
+	GeoSiteURL    string   `json:"geosite_url"`
+	LastGeoUpdate string   `json:"last_geo_update"`
+}
+
+func (g GeoConfig) IsBypassIran() bool {
+	if g.BypassIran == nil {
+		return true
+	}
+	return *g.BypassIran
+}
+
+func (g GeoConfig) IsBypassCN() bool {
+	if g.BypassCN == nil {
+		return true
+	}
+	return *g.BypassCN
+}
+
+func (g GeoConfig) IsBlockAds() bool {
+	if g.BlockAds == nil {
+		return true
+	}
+	return *g.BlockAds
+}
+
+type GeoAssetFile struct {
+	Name          string `json:"name"`
+	Path          string `json:"path"`
+	Exists        bool   `json:"exists"`
+	SizeBytes     int64  `json:"size_bytes"`
+	SizeFormatted string `json:"size_formatted"`
+	ModTime       string `json:"mod_time"`
+}
+
+type GeoAssetsStatus struct {
+	AssetDir string       `json:"asset_dir"`
+	GeoIP    GeoAssetFile `json:"geoip"`
+	GeoSite  GeoAssetFile `json:"geosite"`
+}
+
 type PanelState struct {
 	ProxyMode       string        `json:"proxy_mode"`        // "rule", "global", "direct"
 	ActiveNode      string        `json:"active_node"`
@@ -221,6 +272,7 @@ type PanelState struct {
 	SelectedUIDs    []int         `json:"selected_uids"`
 	LocalhostProxy  bool          `json:"localhost_proxy"`   // Proxy local device (default true)
 	DNS             DNSConfig     `json:"dns"`
+	Geo             GeoConfig     `json:"geo"`
 	Nodes           []NodeProfile `json:"nodes"`
 }
 
@@ -568,6 +620,42 @@ func loadState() PanelState {
 	if st.DNS.QueryStrategy == "" {
 		st.DNS.QueryStrategy = "UseIPv4"
 	}
+
+	boolTrue := true
+	if st.Geo.BypassIran == nil {
+		st.Geo.BypassIran = &boolTrue
+	}
+	if st.Geo.BypassCN == nil {
+		st.Geo.BypassCN = &boolTrue
+	}
+	if st.Geo.BlockAds == nil {
+		st.Geo.BlockAds = &boolTrue
+	}
+	if st.Geo.DirectDomains == nil {
+		st.Geo.DirectDomains = []string{}
+	}
+	if st.Geo.DirectIPs == nil {
+		st.Geo.DirectIPs = []string{}
+	}
+	if st.Geo.ProxyDomains == nil {
+		st.Geo.ProxyDomains = []string{}
+	}
+	if st.Geo.ProxyIPs == nil {
+		st.Geo.ProxyIPs = []string{}
+	}
+	if st.Geo.BlockDomains == nil {
+		st.Geo.BlockDomains = []string{}
+	}
+	if st.Geo.BlockIPs == nil {
+		st.Geo.BlockIPs = []string{}
+	}
+	if st.Geo.GeoIPURL == "" {
+		st.Geo.GeoIPURL = "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geoip.dat"
+	}
+	if st.Geo.GeoSiteURL == "" {
+		st.Geo.GeoSiteURL = "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geosite.dat"
+	}
+
 	return st
 }
 
@@ -678,8 +766,20 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		defaultOutbound = "direct"
 	}
 
-	// Prepare direct domains (domestic Iranian/CN domains, node domain, sub domain)
-	directDomains := []string{"domain:ir", "geosite:ir", "geosite:category-ir", "geosite:cn"}
+	// Prepare direct domains (domestic Iranian/CN domains, custom direct domains, node domain, sub domain)
+	var directDomains []string
+	if st.Geo.IsBypassIran() {
+		directDomains = append(directDomains, "domain:ir", "geosite:ir", "geosite:category-ir")
+	}
+	if st.Geo.IsBypassCN() {
+		directDomains = append(directDomains, "geosite:cn")
+	}
+	for _, d := range st.Geo.DirectDomains {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			directDomains = append(directDomains, d)
+		}
+	}
 	if activeNodeDomain != "" {
 		directDomains = append(directDomains, activeNodeDomain)
 	}
@@ -1011,27 +1111,137 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 	// 5. Routing mode specific rules:
 	switch st.ProxyMode {
 	case "rule":
-		rules = append(rules,
-			map[string]interface{}{
+		// A. Block rules (ads and custom block lists)
+		var blockDomains []string
+		if st.Geo.IsBlockAds() {
+			blockDomains = append(blockDomains, "geosite:category-ads-all")
+		}
+		for _, d := range st.Geo.BlockDomains {
+			d = strings.TrimSpace(d)
+			if d != "" {
+				blockDomains = append(blockDomains, d)
+			}
+		}
+		if len(blockDomains) > 0 {
+			rules = append(rules, map[string]interface{}{
 				"type":        "field",
-				"domain":      []string{"geosite:category-ads-all"},
+				"domain":      blockDomains,
 				"outboundTag": "block",
-			},
-			map[string]interface{}{
+			})
+		}
+
+		var blockIPs []string
+		for _, ip := range st.Geo.BlockIPs {
+			ip = strings.TrimSpace(ip)
+			if ip != "" {
+				blockIPs = append(blockIPs, ip)
+			}
+		}
+		if len(blockIPs) > 0 {
+			rules = append(rules, map[string]interface{}{
 				"type":        "field",
-				"domain":      []string{"domain:ir", "geosite:ir", "geosite:category-ir", "geosite:cn"},
-				"outboundTag": "direct",
-			},
-			map[string]interface{}{
+				"ip":          blockIPs,
+				"outboundTag": "block",
+			})
+		}
+
+		// B. Custom force proxy rules
+		var proxyDomains []string
+		for _, d := range st.Geo.ProxyDomains {
+			d = strings.TrimSpace(d)
+			if d != "" {
+				proxyDomains = append(proxyDomains, d)
+			}
+		}
+		if len(proxyDomains) > 0 {
+			rules = append(rules, map[string]interface{}{
 				"type":        "field",
-				"ip":          []string{"geoip:private", "geoip:ir", "geoip:cn"},
+				"domain":      proxyDomains,
+				"outboundTag": "proxy",
+			})
+		}
+
+		var proxyIPs []string
+		for _, ip := range st.Geo.ProxyIPs {
+			ip = strings.TrimSpace(ip)
+			if ip != "" {
+				proxyIPs = append(proxyIPs, ip)
+			}
+		}
+		if len(proxyIPs) > 0 {
+			rules = append(rules, map[string]interface{}{
+				"type":        "field",
+				"ip":          proxyIPs,
+				"outboundTag": "proxy",
+			})
+		}
+
+		// C. Direct domains (domestic Iran, China, custom direct domains)
+		var ruleDirectDomains []string
+		if st.Geo.IsBypassIran() {
+			ruleDirectDomains = append(ruleDirectDomains, "domain:ir", "geosite:ir", "geosite:category-ir")
+		}
+		if st.Geo.IsBypassCN() {
+			ruleDirectDomains = append(ruleDirectDomains, "geosite:cn")
+		}
+		for _, d := range st.Geo.DirectDomains {
+			d = strings.TrimSpace(d)
+			if d != "" {
+				ruleDirectDomains = append(ruleDirectDomains, d)
+			}
+		}
+		if len(ruleDirectDomains) > 0 {
+			rules = append(rules, map[string]interface{}{
+				"type":        "field",
+				"domain":      ruleDirectDomains,
 				"outboundTag": "direct",
-			},
-		)
-	case "global":
+			})
+		}
+
+		// D. Direct IPs (private LAN, Iran IP, China IP, custom direct IPs)
+		ruleDirectIPs := []string{"geoip:private"}
+		if st.Geo.IsBypassIran() {
+			ruleDirectIPs = append(ruleDirectIPs, "geoip:ir")
+		}
+		if st.Geo.IsBypassCN() {
+			ruleDirectIPs = append(ruleDirectIPs, "geoip:cn")
+		}
+		for _, ip := range st.Geo.DirectIPs {
+			ip = strings.TrimSpace(ip)
+			if ip != "" {
+				ruleDirectIPs = append(ruleDirectIPs, ip)
+			}
+		}
 		rules = append(rules, map[string]interface{}{
 			"type":        "field",
-			"ip":          []string{"geoip:private"},
+			"ip":          ruleDirectIPs,
+			"outboundTag": "direct",
+		})
+	case "global":
+		var customDirectDomains []string
+		for _, d := range st.Geo.DirectDomains {
+			d = strings.TrimSpace(d)
+			if d != "" {
+				customDirectDomains = append(customDirectDomains, d)
+			}
+		}
+		if len(customDirectDomains) > 0 {
+			rules = append(rules, map[string]interface{}{
+				"type":        "field",
+				"domain":      customDirectDomains,
+				"outboundTag": "direct",
+			})
+		}
+		customDirectIPs := []string{"geoip:private"}
+		for _, ip := range st.Geo.DirectIPs {
+			ip = strings.TrimSpace(ip)
+			if ip != "" {
+				customDirectIPs = append(customDirectIPs, ip)
+			}
+		}
+		rules = append(rules, map[string]interface{}{
+			"type":        "field",
+			"ip":          customDirectIPs,
 			"outboundTag": "direct",
 		})
 	case "direct":
@@ -1414,6 +1624,185 @@ func getAssetDir() string {
 		return BaseDir
 	}
 	return AssetDir
+}
+
+func formatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func getGeoAssetInfo() GeoAssetsStatus {
+	assetDir := getAssetDir()
+	status := GeoAssetsStatus{
+		AssetDir: assetDir,
+		GeoIP: GeoAssetFile{
+			Name: "geoip.dat",
+			Path: filepath.Join(assetDir, "geoip.dat"),
+		},
+		GeoSite: GeoAssetFile{
+			Name: "geosite.dat",
+			Path: filepath.Join(assetDir, "geosite.dat"),
+		},
+	}
+
+	if info, err := os.Stat(status.GeoIP.Path); err == nil {
+		status.GeoIP.Exists = true
+		status.GeoIP.SizeBytes = info.Size()
+		status.GeoIP.SizeFormatted = formatBytes(info.Size())
+		status.GeoIP.ModTime = info.ModTime().Format("2006-01-02 15:04:05")
+	} else {
+		status.GeoIP.SizeFormatted = "Not found"
+	}
+
+	if info, err := os.Stat(status.GeoSite.Path); err == nil {
+		status.GeoSite.Exists = true
+		status.GeoSite.SizeBytes = info.Size()
+		status.GeoSite.SizeFormatted = formatBytes(info.Size())
+		status.GeoSite.ModTime = info.ModTime().Format("2006-01-02 15:04:05")
+	} else {
+		status.GeoSite.SizeFormatted = "Not found"
+	}
+
+	return status
+}
+
+func sanitizeStringList(list []string) []string {
+	seen := map[string]bool{}
+	var result []string
+	for _, item := range list {
+		trimmed := strings.TrimSpace(item)
+		if trimmed != "" && !seen[trimmed] {
+			seen[trimmed] = true
+			result = append(result, trimmed)
+		}
+	}
+	if result == nil {
+		return []string{}
+	}
+	return result
+}
+
+func downloadGeoFile(fileURL, targetPath string) (int64, error) {
+	client := &http.Client{
+		Timeout: 90 * time.Second,
+		Transport: &http.Transport{
+			DialContext: directDialer(15 * time.Second).DialContext,
+		},
+	}
+	req, err := http.NewRequest(http.MethodGet, fileURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("User-Agent", "Passwall-Android/"+getModuleVersion())
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("download error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("HTTP error %s", resp.Status)
+	}
+
+	tmpPath := targetPath + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return 0, fmt.Errorf("create file error: %w", err)
+	}
+
+	n, err := io.Copy(f, resp.Body)
+	_ = f.Close()
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return 0, fmt.Errorf("write error: %w", err)
+	}
+
+	if n < 1024 {
+		_ = os.Remove(tmpPath)
+		return 0, fmt.Errorf("downloaded file too small (%d bytes), likely an error page", n)
+	}
+
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		data, readErr := os.ReadFile(tmpPath)
+		if readErr != nil {
+			_ = os.Remove(tmpPath)
+			return 0, err
+		}
+		if writeErr := os.WriteFile(targetPath, data, 0644); writeErr != nil {
+			_ = os.Remove(tmpPath)
+			return 0, writeErr
+		}
+		_ = os.Remove(tmpPath)
+	}
+
+	return n, nil
+}
+
+func updateGeoAssets(geoIPURL, geoSiteURL string) error {
+	st := loadState()
+	if strings.TrimSpace(geoIPURL) == "" {
+		geoIPURL = st.Geo.GeoIPURL
+	}
+	if strings.TrimSpace(geoIPURL) == "" {
+		geoIPURL = "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geoip.dat"
+	}
+	if strings.TrimSpace(geoSiteURL) == "" {
+		geoSiteURL = st.Geo.GeoSiteURL
+	}
+	if strings.TrimSpace(geoSiteURL) == "" {
+		geoSiteURL = "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geosite.dat"
+	}
+
+	assetDir := getAssetDir()
+	_ = os.MkdirAll(assetDir, 0755)
+
+	geoipTarget := filepath.Join(assetDir, "geoip.dat")
+	geositeTarget := filepath.Join(assetDir, "geosite.dat")
+
+	log.Printf("[passwall-droid] downloading geoip from %s", geoIPURL)
+	nIP, err := downloadGeoFile(geoIPURL, geoipTarget)
+	if err != nil {
+		return fmt.Errorf("failed downloading geoip.dat: %w", err)
+	}
+
+	log.Printf("[passwall-droid] downloading geosite from %s", geoSiteURL)
+	nSite, err := downloadGeoFile(geoSiteURL, geositeTarget)
+	if err != nil {
+		return fmt.Errorf("failed downloading geosite.dat: %w", err)
+	}
+
+	log.Printf("[passwall-droid] geo assets updated successfully (geoip: %d bytes, geosite: %d bytes)", nIP, nSite)
+
+	if _, err := os.Stat(PersistDir); err == nil {
+		if data, err := os.ReadFile(geoipTarget); err == nil {
+			_ = os.WriteFile(filepath.Join(PersistDir, "geoip.dat"), data, 0644)
+		}
+		if data, err := os.ReadFile(geositeTarget); err == nil {
+			_ = os.WriteFile(filepath.Join(PersistDir, "geosite.dat"), data, 0644)
+		}
+	}
+
+	st.Geo.GeoIPURL = geoIPURL
+	st.Geo.GeoSiteURL = geoSiteURL
+	st.Geo.LastGeoUpdate = time.Now().Format("2006-01-02 15:04:05")
+	_ = saveState(st)
+
+	engineMu.Lock()
+	active := engineActive
+	engineMu.Unlock()
+	if active {
+		_ = restartProxyEngine()
+	}
+	return nil
 }
 
 func superviseXray(stopCh <-chan struct{}, doneCh chan<- struct{}) {
@@ -2372,6 +2761,7 @@ func startWebDashboard() {
 			"selected_uids":     st.SelectedUIDs,
 			"localhost_proxy":   st.LocalhostProxy,
 			"dns":               st.DNS,
+			"geo":               st.Geo,
 			"module_version":    getModuleVersion(),
 			"xray_version":      getXrayVersion(),
 			"nodes":             st.Nodes,
@@ -2507,6 +2897,120 @@ func startWebDashboard() {
 			return
 		}
 		http.Error(w, "GET or POST required", http.StatusMethodNotAllowed)
+	})
+
+	mux.HandleFunc("/api/geo", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			st := loadState()
+			resp := map[string]interface{}{
+				"bypass_iran":     st.Geo.IsBypassIran(),
+				"bypass_cn":       st.Geo.IsBypassCN(),
+				"block_ads":       st.Geo.IsBlockAds(),
+				"direct_domains":  st.Geo.DirectDomains,
+				"direct_ips":      st.Geo.DirectIPs,
+				"proxy_domains":   st.Geo.ProxyDomains,
+				"proxy_ips":       st.Geo.ProxyIPs,
+				"block_domains":   st.Geo.BlockDomains,
+				"block_ips":       st.Geo.BlockIPs,
+				"geoip_url":       st.Geo.GeoIPURL,
+				"geosite_url":     st.Geo.GeoSiteURL,
+				"last_geo_update": st.Geo.LastGeoUpdate,
+				"assets":          getGeoAssetInfo(),
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		if r.Method == http.MethodPost {
+			var req struct {
+				BypassIran    *bool    `json:"bypass_iran"`
+				BypassCN      *bool    `json:"bypass_cn"`
+				BlockAds      *bool    `json:"block_ads"`
+				DirectDomains []string `json:"direct_domains"`
+				DirectIPs     []string `json:"direct_ips"`
+				ProxyDomains  []string `json:"proxy_domains"`
+				ProxyIPs      []string `json:"proxy_ips"`
+				BlockDomains  []string `json:"block_domains"`
+				BlockIPs      []string `json:"block_ips"`
+				GeoIPURL      string   `json:"geoip_url"`
+				GeoSiteURL    string   `json:"geosite_url"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body: " + err.Error()})
+				return
+			}
+			st := loadState()
+			if req.BypassIran != nil {
+				st.Geo.BypassIran = req.BypassIran
+			}
+			if req.BypassCN != nil {
+				st.Geo.BypassCN = req.BypassCN
+			}
+			if req.BlockAds != nil {
+				st.Geo.BlockAds = req.BlockAds
+			}
+			if req.DirectDomains != nil {
+				st.Geo.DirectDomains = sanitizeStringList(req.DirectDomains)
+			}
+			if req.DirectIPs != nil {
+				st.Geo.DirectIPs = sanitizeStringList(req.DirectIPs)
+			}
+			if req.ProxyDomains != nil {
+				st.Geo.ProxyDomains = sanitizeStringList(req.ProxyDomains)
+			}
+			if req.ProxyIPs != nil {
+				st.Geo.ProxyIPs = sanitizeStringList(req.ProxyIPs)
+			}
+			if req.BlockDomains != nil {
+				st.Geo.BlockDomains = sanitizeStringList(req.BlockDomains)
+			}
+			if req.BlockIPs != nil {
+				st.Geo.BlockIPs = sanitizeStringList(req.BlockIPs)
+			}
+			if strings.TrimSpace(req.GeoIPURL) != "" {
+				st.Geo.GeoIPURL = strings.TrimSpace(req.GeoIPURL)
+			}
+			if strings.TrimSpace(req.GeoSiteURL) != "" {
+				st.Geo.GeoSiteURL = strings.TrimSpace(req.GeoSiteURL)
+			}
+			_ = saveState(st)
+			log.Printf("[passwall-droid] updated geo routing rules (bypass_iran=%v bypass_cn=%v block_ads=%v)",
+				st.Geo.IsBypassIran(), st.Geo.IsBypassCN(), st.Geo.IsBlockAds())
+
+			engineMu.Lock()
+			active := engineActive
+			engineMu.Unlock()
+			if active {
+				_ = restartProxyEngine()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			return
+		}
+		http.Error(w, "GET or POST required", http.StatusMethodNotAllowed)
+	})
+
+	mux.HandleFunc("/api/geo/update", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			GeoIPURL   string `json:"geoip_url"`
+			GeoSiteURL string `json:"geosite_url"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+
+		if err := updateGeoAssets(req.GeoIPURL, req.GeoSiteURL); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ok",
+			"assets": getGeoAssetInfo(),
+		})
 	})
 
 	mux.HandleFunc("/api/sub", func(w http.ResponseWriter, r *http.Request) {
@@ -2822,13 +3326,28 @@ func main() {
 		}
 		return
 
+	case "update-geo":
+		fmt.Println("Updating GeoIP and GeoSite databases over direct WAN...")
+		if err := updateGeoAssets("", ""); err != nil {
+			fmt.Printf("Error updating geo assets: %v\n", err)
+			os.Exit(1)
+		}
+		if pid, ok := isRunning(); ok {
+			p, _ := os.FindProcess(pid)
+			_ = p.Signal(syscall.SIGHUP)
+			fmt.Println("Geo databases updated successfully. Sent reload signal to passwall-droid.")
+		} else {
+			fmt.Println("Geo databases updated successfully.")
+		}
+		return
+
 	case "start":
 		if pid, ok := isRunning(); ok {
 			fmt.Printf("Already running (PID %d)\n", pid)
 			return
 		}
 	default:
-		fmt.Printf("Usage: %s [start|stop|status|reset-config]\n", filepath.Base(os.Args[0]))
+		fmt.Printf("Usage: %s [start|stop|status|reset-config|update-geo]\n", filepath.Base(os.Args[0]))
 		os.Exit(1)
 	}
 
@@ -2952,6 +3471,7 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 <div class="tabs">
   <div class="tab active" id="t-nodes" onclick="showTab('nodes')">Nodes &amp; Sub</div>
   <div class="tab" id="t-dns" onclick="showTab('dns')">DNS</div>
+  <div class="tab" id="t-geo" onclick="showTab('geo')">Geo Rules</div>
   <div class="tab" id="t-apps" onclick="showTab('apps')">Apps</div>
   <div class="tab" id="t-config" onclick="showTab('config')">Config</div>
   <div class="tab" id="t-logs" onclick="showTab('logs')">Logs</div>
@@ -3025,6 +3545,86 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
   <button class="btn-green" style="width:100%" onclick="saveDNS()">Save &amp; Apply DNS</button>
 </div>
 
+<div id="p-geo" class="card hidden">
+  <div class="title" style="font-size:13px;margin-bottom:6px">Geo Routing &amp; Rules Settings</div>
+  <div class="meta" style="margin-bottom:10px">Manage Geosite/GeoIP rule policies for Rule Mode. Bypass domestic services, block ads and trackers, configure custom routing domains and IP lists, and update Geo databases.</div>
+
+  <div style="background:#0f172a;border:1px solid #334155;border-radius:7px;padding:10px;margin-bottom:12px">
+    <div style="font-size:12px;font-weight:700;color:#f8fafc;margin-bottom:8px">Built-in Rule Policies (Rule Mode)</div>
+    
+    <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;color:#cbd5e1;cursor:pointer;margin-bottom:8px">
+      <input id="geoBypassIranChk" type="checkbox" style="width:18px;height:18px;margin:2px 0 0 0">
+      <span><b>Bypass Iran Domestic Traffic (domain:ir, geosite:ir, geoip:ir)</b><span class="node-sub" style="display:block">Directly routes Iranian national websites, payment gateways, and banking services without proxy.</span></span>
+    </label>
+
+    <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;color:#cbd5e1;cursor:pointer;margin-bottom:8px">
+      <input id="geoBypassCNChk" type="checkbox" style="width:18px;height:18px;margin:2px 0 0 0">
+      <span><b>Bypass China Traffic (geosite:cn, geoip:cn)</b><span class="node-sub" style="display:block">Directly routes Chinese mainland domains and IP ranges.</span></span>
+    </label>
+
+    <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;color:#cbd5e1;cursor:pointer">
+      <input id="geoBlockAdsChk" type="checkbox" style="width:18px;height:18px;margin:2px 0 0 0">
+      <span><b>Block Advertisements &amp; Tracking (geosite:category-ads-all)</b><span class="node-sub" style="display:block">Drop DNS queries and connections to known ad-servers, telemetry, and malicious domains.</span></span>
+    </label>
+  </div>
+
+  <div class="title" style="font-size:13px;margin:12px 0 6px">Custom Routing Lists</div>
+  <div class="meta" style="margin-bottom:8px">One entry per line. Supports domains (<code>example.com</code>, <code>domain:ir</code>), geosite tags (<code>geosite:google</code>), IP addresses (<code>1.2.3.4</code>), CIDRs (<code>10.0.0.0/8</code>), or geoip tags (<code>geoip:telegram</code>).</div>
+
+  <div style="margin-bottom:10px">
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#34d399">Direct / Bypass Domains (Direct WAN)</div>
+    <textarea id="geoDirectDomains" style="min-height:75px;margin-bottom:6px" placeholder="domain:ir&#10;geosite:category-media-ir&#10;mybank.com"></textarea>
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#34d399">Direct / Bypass IPs &amp; CIDRs (Direct WAN)</div>
+    <textarea id="geoDirectIPs" style="min-height:75px;margin-bottom:8px" placeholder="geoip:ir&#10;192.168.0.0/16&#10;10.0.0.0/8"></textarea>
+  </div>
+
+  <div style="margin-bottom:10px">
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#38bdf8">Force Proxy Domains (Route through Node)</div>
+    <textarea id="geoProxyDomains" style="min-height:75px;margin-bottom:6px" placeholder="geosite:google&#10;geosite:telegram&#10;domain:youtube.com"></textarea>
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#38bdf8">Force Proxy IPs &amp; CIDRs (Route through Node)</div>
+    <textarea id="geoProxyIPs" style="min-height:75px;margin-bottom:8px" placeholder="geoip:telegram&#10;91.108.4.0/22"></textarea>
+  </div>
+
+  <div style="margin-bottom:10px">
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#f87171">Block Domains (Blackhole)</div>
+    <textarea id="geoBlockDomains" style="min-height:75px;margin-bottom:6px" placeholder="geosite:category-ads&#10;domain:adservice.google.com"></textarea>
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#f87171">Block IPs &amp; CIDRs (Blackhole)</div>
+    <textarea id="geoBlockIPs" style="min-height:75px;margin-bottom:8px" placeholder="198.51.100.99&#10;geoip:phishing"></textarea>
+  </div>
+
+  <button class="btn-green" style="width:100%;margin-bottom:14px" onclick="saveGeo()">Save &amp; Apply Geo Rules</button>
+
+  <div style="border-top:1px solid #334155;padding-top:12px;margin-top:6px">
+    <div class="header">
+      <div class="title" style="font-size:13px">Geo Database Files</div>
+      <button id="btnUpdateGeo" class="btn-blue btn-sm" onclick="updateGeoDatabases()">Update Geo Files</button>
+    </div>
+    <div class="meta" id="geoAssetMeta">Checking geo files...</div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+      <div style="background:#0f172a;border:1px solid #334155;border-radius:7px;padding:8px">
+        <div style="font-size:12px;font-weight:700;color:#f8fafc">geoip.dat</div>
+        <div id="geoipStatus" class="meta" style="margin-top:4px">Status: Loading...</div>
+      </div>
+      <div style="background:#0f172a;border:1px solid #334155;border-radius:7px;padding:8px">
+        <div style="font-size:12px;font-weight:700;color:#f8fafc">geosite.dat</div>
+        <div id="geositeStatus" class="meta" style="margin-top:4px">Status: Loading...</div>
+      </div>
+    </div>
+
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">GeoIP Download URL</div>
+    <input id="geoIpUrlInput" type="text" placeholder="https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geoip.dat">
+
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">GeoSite Download URL</div>
+    <input id="geoSiteUrlInput" type="text" placeholder="https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geosite.dat">
+
+    <div class="row" style="margin-bottom:8px">
+      <button class="btn-sm" onclick="setGeoPreset('iran')">Iran Rules (Chocolate4U)</button>
+      <button class="btn-sm" onclick="setGeoPreset('v2fly')">Global Rules (Loyalsoldier)</button>
+    </div>
+  </div>
+</div>
+
 <div id="p-apps" class="card hidden">
   <div class="title" style="font-size:13px;margin-bottom:6px">Per-App Split Tunneling (Hotspot always proxied)</div>
   <select id="appModeSel">
@@ -3079,13 +3679,14 @@ function showMsg(txt) {
 }
 
 function showTab(name) {
-  var tabs = ["nodes", "dns", "apps", "config", "logs"];
+  var tabs = ["nodes", "dns", "geo", "apps", "config", "logs"];
   for (var i = 0; i < tabs.length; i++) {
     var t = tabs[i];
     document.getElementById("t-" + t).className = (t === name) ? "tab active" : "tab";
     document.getElementById("p-" + t).className = (t === name) ? "card" : "card hidden";
   }
   if (name === "dns") { loadDNS(); }
+  if (name === "geo") { loadGeo(); }
   if (name === "apps") { loadApps(); }
   if (name === "config") { loadConfig(); }
   if (name === "logs") { loadLogs(); }
@@ -3120,6 +3721,118 @@ function saveDNS() {
       showMsg("DNS error: " + (err.error || text));
     }
   });
+}
+
+function loadGeo() {
+  req("GET", "/api/geo", null, function(code, text) {
+    if (code !== 200) { return; }
+    var d = JSON.parse(text);
+    document.getElementById("geoBypassIranChk").checked = (d.bypass_iran !== false);
+    document.getElementById("geoBypassCNChk").checked = (d.bypass_cn !== false);
+    document.getElementById("geoBlockAdsChk").checked = (d.block_ads !== false);
+
+    document.getElementById("geoDirectDomains").value = (d.direct_domains || []).join("\n");
+    document.getElementById("geoDirectIPs").value = (d.direct_ips || []).join("\n");
+    document.getElementById("geoProxyDomains").value = (d.proxy_domains || []).join("\n");
+    document.getElementById("geoProxyIPs").value = (d.proxy_ips || []).join("\n");
+    document.getElementById("geoBlockDomains").value = (d.block_domains || []).join("\n");
+    document.getElementById("geoBlockIPs").value = (d.block_ips || []).join("\n");
+
+    document.getElementById("geoIpUrlInput").value = d.geoip_url || "";
+    document.getElementById("geoSiteUrlInput").value = d.geosite_url || "";
+
+    var assetDir = (d.assets && d.assets.asset_dir) || "";
+    document.getElementById("geoAssetMeta").innerHTML =
+      "Last updated: " + (d.last_geo_update || "Never") + (assetDir ? (" | Path: " + esc(assetDir)) : "");
+
+    var ipBox = document.getElementById("geoipStatus");
+    if (ipBox) {
+      if (d.assets && d.assets.geoip && d.assets.geoip.exists) {
+        ipBox.innerHTML = esc(d.assets.geoip.size_formatted) + "<br><span style=\"color:#64748b\">" + esc(d.assets.geoip.mod_time) + "</span>";
+      } else {
+        ipBox.innerHTML = "<span style=\"color:#f87171\">Not installed</span>";
+      }
+    }
+
+    var siteBox = document.getElementById("geositeStatus");
+    if (siteBox) {
+      if (d.assets && d.assets.geosite && d.assets.geosite.exists) {
+        siteBox.innerHTML = esc(d.assets.geosite.size_formatted) + "<br><span style=\"color:#64748b\">" + esc(d.assets.geosite.mod_time) + "</span>";
+      } else {
+        siteBox.innerHTML = "<span style=\"color:#f87171\">Not installed</span>";
+      }
+    }
+  });
+}
+
+function parseLines(id) {
+  var val = document.getElementById(id).value;
+  var arr = val.split("\n");
+  var out = [];
+  for (var i = 0; i < arr.length; i++) {
+    var s = arr[i].trim();
+    if (s) { out.push(s); }
+  }
+  return out;
+}
+
+function saveGeo() {
+  var body = {
+    bypass_iran: document.getElementById("geoBypassIranChk").checked,
+    bypass_cn: document.getElementById("geoBypassCNChk").checked,
+    block_ads: document.getElementById("geoBlockAdsChk").checked,
+    direct_domains: parseLines("geoDirectDomains"),
+    direct_ips: parseLines("geoDirectIPs"),
+    proxy_domains: parseLines("geoProxyDomains"),
+    proxy_ips: parseLines("geoProxyIPs"),
+    block_domains: parseLines("geoBlockDomains"),
+    block_ips: parseLines("geoBlockIPs"),
+    geoip_url: document.getElementById("geoIpUrlInput").value.trim(),
+    geosite_url: document.getElementById("geoSiteUrlInput").value.trim()
+  };
+  showMsg("Saving geo routing rules and updating engine...");
+  req("POST", "/api/geo", body, function(code, text) {
+    if (code === 200) {
+      showMsg("Geo rules updated and proxy engine restarted.");
+      refreshStatus();
+    } else {
+      var err = {};
+      try { err = JSON.parse(text); } catch(e){}
+      showMsg("Geo rules error: " + (err.error || text));
+    }
+  });
+}
+
+function updateGeoDatabases() {
+  var btn = document.getElementById("btnUpdateGeo");
+  if (btn) { btn.disabled = true; }
+  showMsg("Downloading GeoIP and GeoSite databases over direct WAN...");
+  var body = {
+    geoip_url: document.getElementById("geoIpUrlInput").value.trim(),
+    geosite_url: document.getElementById("geoSiteUrlInput").value.trim()
+  };
+  req("POST", "/api/geo/update", body, function(code, text) {
+    if (btn) { btn.disabled = false; }
+    if (code === 200) {
+      showMsg("Geo databases updated successfully.");
+      loadGeo();
+      refreshStatus();
+    } else {
+      var err = {};
+      try { err = JSON.parse(text); } catch(e){}
+      showMsg("Geo update error: " + (err.error || text));
+    }
+  });
+}
+
+function setGeoPreset(preset) {
+  if (preset === "iran") {
+    document.getElementById("geoIpUrlInput").value = "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geoip.dat";
+    document.getElementById("geoSiteUrlInput").value = "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geosite.dat";
+  } else if (preset === "v2fly") {
+    document.getElementById("geoIpUrlInput").value = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat";
+    document.getElementById("geoSiteUrlInput").value = "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat";
+  }
 }
 
 function checkConn() {

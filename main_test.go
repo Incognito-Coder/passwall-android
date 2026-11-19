@@ -2104,3 +2104,535 @@ func TestGoogleComRoutingAndDNSResolution(t *testing.T) {
 		t.Errorf("expected fallthrough outbound to be direct when no nodes are imported, got %v", lastRule["outboundTag"])
 	}
 }
+
+func TestWebUIGeoTabExists(t *testing.T) {
+	// Verify Geo Rules tab and panel elements exist in dashboardHTML
+	checks := []string{
+		`id="t-geo" onclick="showTab('geo')">Geo Rules</div>`,
+		`id="p-geo" class="card hidden"`,
+		`id="geoBypassIranChk"`,
+		`id="geoBypassCNChk"`,
+		`id="geoBlockAdsChk"`,
+		`id="geoDirectDomains"`,
+		`id="geoDirectIPs"`,
+		`id="geoProxyDomains"`,
+		`id="geoProxyIPs"`,
+		`id="geoBlockDomains"`,
+		`id="geoBlockIPs"`,
+		`id="btnUpdateGeo"`,
+		`id="geoIpUrlInput"`,
+		`id="geoSiteUrlInput"`,
+		`function loadGeo()`,
+		`function saveGeo()`,
+		`function updateGeoDatabases()`,
+		`function setGeoPreset(`,
+		`/api/geo`,
+		`/api/geo/update`,
+	}
+
+	for _, str := range checks {
+		if !strings.Contains(dashboardHTML, str) {
+			t.Errorf("dashboardHTML missing expected element: %s", str)
+		}
+	}
+
+	// Verify showTab handles "geo"
+	if !strings.Contains(dashboardHTML, `"geo"`) || !strings.Contains(dashboardHTML, `name === "geo"`) {
+		t.Errorf("showTab does not properly support 'geo' tab")
+	}
+}
+
+func TestGeoConfigDefaultsAndLoadState(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersist := PersistStateFile
+	defer func() {
+		StateFile = origState
+		PersistStateFile = origPersist
+	}()
+
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+
+	st := loadState()
+	if !st.Geo.IsBypassIran() {
+		t.Errorf("expected default IsBypassIran to be true")
+	}
+	if !st.Geo.IsBypassCN() {
+		t.Errorf("expected default IsBypassCN to be true")
+	}
+	if !st.Geo.IsBlockAds() {
+		t.Errorf("expected default IsBlockAds to be true")
+	}
+	if st.Geo.DirectDomains == nil || len(st.Geo.DirectDomains) != 0 {
+		t.Errorf("expected empty non-nil DirectDomains slice")
+	}
+	if st.Geo.DirectIPs == nil || len(st.Geo.DirectIPs) != 0 {
+		t.Errorf("expected empty non-nil DirectIPs slice")
+	}
+	if st.Geo.ProxyDomains == nil || len(st.Geo.ProxyDomains) != 0 {
+		t.Errorf("expected empty non-nil ProxyDomains slice")
+	}
+	if st.Geo.ProxyIPs == nil || len(st.Geo.ProxyIPs) != 0 {
+		t.Errorf("expected empty non-nil ProxyIPs slice")
+	}
+	if st.Geo.BlockDomains == nil || len(st.Geo.BlockDomains) != 0 {
+		t.Errorf("expected empty non-nil BlockDomains slice")
+	}
+	if st.Geo.BlockIPs == nil || len(st.Geo.BlockIPs) != 0 {
+		t.Errorf("expected empty non-nil BlockIPs slice")
+	}
+	if !strings.Contains(st.Geo.GeoIPURL, "geoip.dat") {
+		t.Errorf("expected default GeoIPURL containing geoip.dat, got %s", st.Geo.GeoIPURL)
+	}
+	if !strings.Contains(st.Geo.GeoSiteURL, "geosite.dat") {
+		t.Errorf("expected default GeoSiteURL containing geosite.dat, got %s", st.Geo.GeoSiteURL)
+	}
+}
+
+func TestApiGeoGetAndPost(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersist := PersistStateFile
+	origBase := BaseConfig
+	origRuntime := RuntimeConfig
+	origAsset := AssetDir
+	defer func() {
+		StateFile = origState
+		PersistStateFile = origPersist
+		BaseConfig = origBase
+		RuntimeConfig = origRuntime
+		AssetDir = origAsset
+	}()
+
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+	AssetDir = filepath.Join(tmpDir, "bin")
+	_ = os.MkdirAll(AssetDir, 0755)
+	_ = os.WriteFile(BaseConfig, []byte(DefaultBaseConfigJSON), 0644)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/geo", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			st := loadState()
+			resp := map[string]interface{}{
+				"bypass_iran":     st.Geo.IsBypassIran(),
+				"bypass_cn":       st.Geo.IsBypassCN(),
+				"block_ads":       st.Geo.IsBlockAds(),
+				"direct_domains":  st.Geo.DirectDomains,
+				"direct_ips":      st.Geo.DirectIPs,
+				"proxy_domains":   st.Geo.ProxyDomains,
+				"proxy_ips":       st.Geo.ProxyIPs,
+				"block_domains":   st.Geo.BlockDomains,
+				"block_ips":       st.Geo.BlockIPs,
+				"geoip_url":       st.Geo.GeoIPURL,
+				"geosite_url":     st.Geo.GeoSiteURL,
+				"last_geo_update": st.Geo.LastGeoUpdate,
+				"assets":          getGeoAssetInfo(),
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		if r.Method == http.MethodPost {
+			var req struct {
+				BypassIran    *bool    `json:"bypass_iran"`
+				BypassCN      *bool    `json:"bypass_cn"`
+				BlockAds      *bool    `json:"block_ads"`
+				DirectDomains []string `json:"direct_domains"`
+				DirectIPs     []string `json:"direct_ips"`
+				ProxyDomains  []string `json:"proxy_domains"`
+				ProxyIPs      []string `json:"proxy_ips"`
+				BlockDomains  []string `json:"block_domains"`
+				BlockIPs      []string `json:"block_ips"`
+				GeoIPURL      string   `json:"geoip_url"`
+				GeoSiteURL    string   `json:"geosite_url"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body: " + err.Error()})
+				return
+			}
+			st := loadState()
+			if req.BypassIran != nil {
+				st.Geo.BypassIran = req.BypassIran
+			}
+			if req.BypassCN != nil {
+				st.Geo.BypassCN = req.BypassCN
+			}
+			if req.BlockAds != nil {
+				st.Geo.BlockAds = req.BlockAds
+			}
+			if req.DirectDomains != nil {
+				st.Geo.DirectDomains = sanitizeStringList(req.DirectDomains)
+			}
+			if req.DirectIPs != nil {
+				st.Geo.DirectIPs = sanitizeStringList(req.DirectIPs)
+			}
+			if req.ProxyDomains != nil {
+				st.Geo.ProxyDomains = sanitizeStringList(req.ProxyDomains)
+			}
+			if req.ProxyIPs != nil {
+				st.Geo.ProxyIPs = sanitizeStringList(req.ProxyIPs)
+			}
+			if req.BlockDomains != nil {
+				st.Geo.BlockDomains = sanitizeStringList(req.BlockDomains)
+			}
+			if req.BlockIPs != nil {
+				st.Geo.BlockIPs = sanitizeStringList(req.BlockIPs)
+			}
+			if strings.TrimSpace(req.GeoIPURL) != "" {
+				st.Geo.GeoIPURL = strings.TrimSpace(req.GeoIPURL)
+			}
+			if strings.TrimSpace(req.GeoSiteURL) != "" {
+				st.Geo.GeoSiteURL = strings.TrimSpace(req.GeoSiteURL)
+			}
+			_ = saveState(st)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			return
+		}
+		http.Error(w, "GET or POST required", http.StatusMethodNotAllowed)
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// 1. GET /api/geo
+	resp, err := http.Get(server.URL + "/api/geo")
+	if err != nil {
+		t.Fatalf("GET /api/geo failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	var getRes map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&getRes)
+	if getRes["bypass_iran"] != true || getRes["bypass_cn"] != true || getRes["block_ads"] != true {
+		t.Errorf("expected default booleans to be true, got %v", getRes)
+	}
+
+	// 2. POST /api/geo with custom settings
+	bFalse := false
+	postBody := map[string]interface{}{
+		"bypass_iran":    true,
+		"bypass_cn":      bFalse,
+		"block_ads":      bFalse,
+		"direct_domains": []string{"custom-direct.com", "geosite:category-tech-ir"},
+		"direct_ips":     []string{"192.168.10.0/24", "geoip:ir"},
+		"proxy_domains":  []string{"geosite:google", "blocked-service.com"},
+		"proxy_ips":      []string{"geoip:telegram", "91.108.4.0/22"},
+		"block_domains":  []string{"tracker.test", "ads.example.com"},
+		"block_ips":      []string{"198.51.100.44"},
+		"geoip_url":      "https://example.com/geoip.dat",
+		"geosite_url":    "https://example.com/geosite.dat",
+	}
+	bodyBytes, _ := json.Marshal(postBody)
+	postResp, err := http.Post(server.URL+"/api/geo", "application/json", bytes.NewReader(bodyBytes))
+	if err != nil {
+		t.Fatalf("POST /api/geo failed: %v", err)
+	}
+	defer postResp.Body.Close()
+	if postResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on POST, got %d", postResp.StatusCode)
+	}
+
+	// 3. Verify state updated
+	stUpdated := loadState()
+	if !stUpdated.Geo.IsBypassIran() {
+		t.Errorf("expected IsBypassIran to be true")
+	}
+	if stUpdated.Geo.IsBypassCN() {
+		t.Errorf("expected IsBypassCN to be false")
+	}
+	if stUpdated.Geo.IsBlockAds() {
+		t.Errorf("expected IsBlockAds to be false")
+	}
+	if len(stUpdated.Geo.DirectDomains) != 2 || stUpdated.Geo.DirectDomains[0] != "custom-direct.com" {
+		t.Errorf("unexpected DirectDomains: %v", stUpdated.Geo.DirectDomains)
+	}
+	if len(stUpdated.Geo.ProxyDomains) != 2 || stUpdated.Geo.ProxyDomains[0] != "geosite:google" {
+		t.Errorf("unexpected ProxyDomains: %v", stUpdated.Geo.ProxyDomains)
+	}
+	if len(stUpdated.Geo.BlockDomains) != 2 || stUpdated.Geo.BlockDomains[0] != "tracker.test" {
+		t.Errorf("unexpected BlockDomains: %v", stUpdated.Geo.BlockDomains)
+	}
+	if stUpdated.Geo.GeoIPURL != "https://example.com/geoip.dat" {
+		t.Errorf("unexpected GeoIPURL: %s", stUpdated.Geo.GeoIPURL)
+	}
+}
+
+func TestPrepareRuntimeConfigGeoRulesCustomization(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersist := PersistStateFile
+	origBase := BaseConfig
+	origRuntime := RuntimeConfig
+	defer func() {
+		StateFile = origState
+		PersistStateFile = origPersist
+		BaseConfig = origBase
+		RuntimeConfig = origRuntime
+	}()
+
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+
+	_ = os.WriteFile(BaseConfig, []byte(DefaultBaseConfigJSON), 0644)
+
+	bFalse := false
+	bTrue := true
+	st := PanelState{
+		ProxyMode:  "rule",
+		ActiveNode: "node-1",
+		Nodes: []NodeProfile{
+			{
+				ID:       "node-1",
+				Name:     "Test Node",
+				Protocol: "vless",
+				Address:  "vpn.example.com",
+				Port:     443,
+			},
+		},
+		DNS: DNSConfig{
+			RemoteDNS:     "tcp://1.1.1.1",
+			DirectDNS:     "1.1.1.1",
+			QueryStrategy: "UseIPv4",
+		},
+		Geo: GeoConfig{
+			BypassIran:    &bTrue,
+			BypassCN:      &bFalse, // China bypass disabled
+			BlockAds:      &bFalse, // Ad block disabled
+			DirectDomains: []string{"custom-direct.org"},
+			DirectIPs:     []string{"10.50.0.0/16"},
+			ProxyDomains:  []string{"force-proxy.org"},
+			ProxyIPs:      []string{"93.184.216.34"},
+			BlockDomains:  []string{"custom-blocked.com"},
+			BlockIPs:      []string{"198.51.100.88"},
+		},
+	}
+	if err := saveState(st); err != nil {
+		t.Fatalf("saveState failed: %v", err)
+	}
+
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(RuntimeConfig)
+	if err != nil {
+		t.Fatalf("read runtime config failed: %v", err)
+	}
+
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("unmarshal runtime config failed: %v", err)
+	}
+
+	// Verify DNS direct resolution includes custom-direct.org and does NOT include geosite:cn
+	dnsCfg := cfg["dns"].(map[string]interface{})
+	servers := dnsCfg["servers"].([]interface{})
+	directServer := servers[0].(map[string]interface{})
+	directDoms := directServer["domains"].([]interface{})
+	hasCustomDirectDNS := false
+	hasCNDNS := false
+	for _, d := range directDoms {
+		if d == "custom-direct.org" {
+			hasCustomDirectDNS = true
+		}
+		if d == "geosite:cn" {
+			hasCNDNS = true
+		}
+	}
+	if !hasCustomDirectDNS {
+		t.Errorf("expected custom-direct.org in direct DNS server domains: %v", directDoms)
+	}
+	if hasCNDNS {
+		t.Errorf("geosite:cn should not be in direct DNS when BypassCN is false: %v", directDoms)
+	}
+
+	// Verify routing rules
+	routing := cfg["routing"].(map[string]interface{})
+	rules := routing["rules"].([]interface{})
+
+	foundCustomDirectDom := false
+	foundCustomDirectIP := false
+	foundForceProxyDom := false
+	foundForceProxyIP := false
+	foundCustomBlockDom := false
+	foundCustomBlockIP := false
+	foundDefaultAds := false
+	foundCNRoute := false
+
+	for _, r := range rules {
+		rm := r.(map[string]interface{})
+		tag := rm["outboundTag"]
+		if doms, ok := rm["domain"].([]interface{}); ok {
+			for _, d := range doms {
+				if d == "custom-direct.org" && tag == "direct" {
+					foundCustomDirectDom = true
+				}
+				if d == "force-proxy.org" && tag == "proxy" {
+					foundForceProxyDom = true
+				}
+				if d == "custom-blocked.com" && tag == "block" {
+					foundCustomBlockDom = true
+				}
+				if d == "geosite:category-ads-all" {
+					foundDefaultAds = true
+				}
+				if d == "geosite:cn" {
+					foundCNRoute = true
+				}
+			}
+		}
+		if ips, ok := rm["ip"].([]interface{}); ok {
+			for _, ip := range ips {
+				if ip == "10.50.0.0/16" && tag == "direct" {
+					foundCustomDirectIP = true
+				}
+				if ip == "93.184.216.34" && tag == "proxy" {
+					foundForceProxyIP = true
+				}
+				if ip == "198.51.100.88" && tag == "block" {
+					foundCustomBlockIP = true
+				}
+			}
+		}
+	}
+
+	if !foundCustomDirectDom {
+		t.Errorf("expected custom-direct.org routed to direct outbound")
+	}
+	if !foundCustomDirectIP {
+		t.Errorf("expected 10.50.0.0/16 routed to direct outbound")
+	}
+	if !foundForceProxyDom {
+		t.Errorf("expected force-proxy.org routed to proxy outbound")
+	}
+	if !foundForceProxyIP {
+		t.Errorf("expected 93.184.216.34 routed to proxy outbound")
+	}
+	if !foundCustomBlockDom {
+		t.Errorf("expected custom-blocked.com routed to block outbound")
+	}
+	if !foundCustomBlockIP {
+		t.Errorf("expected 198.51.100.88 routed to block outbound")
+	}
+	if foundDefaultAds {
+		t.Errorf("geosite:category-ads-all should not be present when BlockAds is false")
+	}
+	if foundCNRoute {
+		t.Errorf("geosite:cn should not be in routing rules when BypassCN is false")
+	}
+}
+
+func TestGetGeoAssetInfoAndFormatBytes(t *testing.T) {
+	// 1. Test formatBytes
+	if fb := formatBytes(500); fb != "500 B" {
+		t.Errorf("expected '500 B', got %s", fb)
+	}
+	if fb := formatBytes(2048); fb != "2.00 KB" {
+		t.Errorf("expected '2.00 KB', got %s", fb)
+	}
+	if fb := formatBytes(1048576 * 3); fb != "3.00 MB" {
+		t.Errorf("expected '3.00 MB', got %s", fb)
+	}
+
+	// 2. Test getGeoAssetInfo with non-existent assets
+	tmpDir := t.TempDir()
+	origAsset := AssetDir
+	defer func() { AssetDir = origAsset }()
+	AssetDir = tmpDir
+
+	infoNone := getGeoAssetInfo()
+	if infoNone.GeoIP.Exists || infoNone.GeoSite.Exists {
+		t.Errorf("expected both assets not to exist in empty temp dir")
+	}
+
+	// 3. Test with mock files
+	geoipDummy := make([]byte, 2048)
+	geositeDummy := make([]byte, 4096)
+	_ = os.WriteFile(filepath.Join(tmpDir, "geoip.dat"), geoipDummy, 0644)
+	_ = os.WriteFile(filepath.Join(tmpDir, "geosite.dat"), geositeDummy, 0644)
+
+	infoExists := getGeoAssetInfo()
+	if !infoExists.GeoIP.Exists || infoExists.GeoIP.SizeBytes != 2048 {
+		t.Errorf("expected geoip.dat to exist with size 2048: %+v", infoExists.GeoIP)
+	}
+	if !infoExists.GeoSite.Exists || infoExists.GeoSite.SizeBytes != 4096 {
+		t.Errorf("expected geosite.dat to exist with size 4096: %+v", infoExists.GeoSite)
+	}
+}
+
+func TestDownloadAndApiGeoUpdate(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersist := PersistStateFile
+	origAsset := AssetDir
+	defer func() {
+		StateFile = origState
+		PersistStateFile = origPersist
+		AssetDir = origAsset
+	}()
+
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+	AssetDir = filepath.Join(tmpDir, "bin")
+	_ = os.MkdirAll(AssetDir, 0755)
+
+	// Mock file server serving valid test geo data (>1KB)
+	mockIPData := make([]byte, 4096)
+	for i := range mockIPData {
+		mockIPData[i] = 0xAA
+	}
+	mockSiteData := make([]byte, 8192)
+	for i := range mockSiteData {
+		mockSiteData[i] = 0xBB
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/geoip.dat":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mockIPData)
+		case "/geosite.dat":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(mockSiteData)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	// Update geo assets using server URLs
+	err := updateGeoAssets(server.URL+"/geoip.dat", server.URL+"/geosite.dat")
+	if err != nil {
+		t.Fatalf("updateGeoAssets failed: %v", err)
+	}
+
+	// Verify files downloaded
+	ipBytes, err := os.ReadFile(filepath.Join(AssetDir, "geoip.dat"))
+	if err != nil || len(ipBytes) != 4096 {
+		t.Fatalf("geoip.dat not downloaded properly, size: %d, err: %v", len(ipBytes), err)
+	}
+
+	siteBytes, err := os.ReadFile(filepath.Join(AssetDir, "geosite.dat"))
+	if err != nil || len(siteBytes) != 8192 {
+		t.Fatalf("geosite.dat not downloaded properly, size: %d, err: %v", len(siteBytes), err)
+	}
+
+	// Verify state saved with last_geo_update
+	st := loadState()
+	if st.Geo.LastGeoUpdate == "" {
+		t.Errorf("expected LastGeoUpdate timestamp to be set")
+	}
+	if st.Geo.GeoIPURL != server.URL+"/geoip.dat" {
+		t.Errorf("unexpected GeoIPURL: %s", st.Geo.GeoIPURL)
+	}
+}
