@@ -2,11 +2,8 @@ name: Build & Release Passwall Android Magisk Module
 
 on:
   push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
-  schedule:
-    # Check daily at 04:00 UTC for new XTLS/Xray-core releases
-    - cron: '0 4 * * *'
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       xray_version:
@@ -14,11 +11,11 @@ on:
         required: false
         default: ''
       module_version:
-        description: 'Optional module version (e.g. v1.2.1, leave empty to auto-derive from tag/branch)'
+        description: 'Optional module version (e.g. v1.2.4, leave empty to auto-derive from tag/branch)'
         required: false
         default: ''
       module_version_code:
-        description: 'Optional module versionCode (e.g. 121, leave empty to auto-derive)'
+        description: 'Optional module versionCode (e.g. 124, leave empty to auto-derive)'
         required: false
         default: ''
 
@@ -59,22 +56,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Resolved Xray-core tag: $TAG"
 
-      - name: Check if scheduled release already exists
-        id: check_rel
-        if: github.event_name == 'schedule'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          REL_TAG="xray-${{ steps.xray.outputs.tag }}"
-          if gh release view "$REL_TAG" >/dev/null 2>&1; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Release $REL_TAG already published; skipping."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Build universal Magisk ZIP (ARMv7 + ARM64)
-        if: steps.check_rel.outputs.skip != 'true'
         env:
           XRAY_VER: ${{ steps.xray.outputs.tag }}
           INPUT_MOD_VER: ${{ github.event.inputs.module_version }}
@@ -85,7 +67,7 @@ jobs:
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             MOD_VER="${GITHUB_REF_NAME}"
           else
-            MOD_VER="v1.2.0-${XRAY_VER}"
+            MOD_VER="v1.2.4-${XRAY_VER}"
           fi
 
           if [ -n "$INPUT_MOD_CODE" ]; then
@@ -96,7 +78,7 @@ jobs:
             PATCH="${BASH_REMATCH[4]:-0}"
             MOD_CODE=$(( 10#$MAJOR * 100 + 10#$MINOR * 10 + 10#$PATCH ))
           else
-            MOD_CODE=$(grep -E '^versionCode=' module/module.prop | cut -d= -f2 || echo 120)
+            MOD_CODE=$(grep -E '^versionCode=' module/module.prop | cut -d= -f2 || echo 124)
           fi
 
           echo "MOD_VER=${MOD_VER}" >> "$GITHUB_ENV"
@@ -107,10 +89,9 @@ jobs:
           sha256sum "passwall-android-${MOD_VER}-universal.zip" > "passwall-android-${MOD_VER}-universal.zip.sha256"
 
       - name: Publish GitHub Release
-        if: steps.check_rel.outputs.skip != 'true'
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('xray-{0}', steps.xray.outputs.tag) }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || (github.event.inputs.module_version != '' && github.event.inputs.module_version || format('xray-{0}', steps.xray.outputs.tag)) }}
           name: Passwall Android ${{ env.MOD_VER }} (Xray ${{ steps.xray.outputs.tag }})
           generate_release_notes: true
           fail_on_unmatched_files: true
