@@ -11,11 +11,11 @@ on:
         required: false
         default: ''
       module_version:
-        description: 'Optional module version (e.g. v1.2.4, leave empty to auto-derive from tag/branch)'
+        description: 'Optional module version (e.g. v1.2.5, leave empty to auto-derive from tag/branch)'
         required: false
         default: ''
       module_version_code:
-        description: 'Optional module versionCode (e.g. 124, leave empty to auto-derive)'
+        description: 'Optional module versionCode (e.g. 125, leave empty to auto-derive)'
         required: false
         default: ''
 
@@ -67,7 +67,7 @@ jobs:
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             MOD_VER="${GITHUB_REF_NAME}"
           else
-            MOD_VER="v1.2.4-${XRAY_VER}"
+            MOD_VER="v1.2.5-${XRAY_VER}"
           fi
 
           if [ -n "$INPUT_MOD_CODE" ]; then
@@ -78,7 +78,7 @@ jobs:
             PATCH="${BASH_REMATCH[4]:-0}"
             MOD_CODE=$(( 10#$MAJOR * 100 + 10#$MINOR * 10 + 10#$PATCH ))
           else
-            MOD_CODE=$(grep -E '^versionCode=' module/module.prop | cut -d= -f2 || echo 124)
+            MOD_CODE=$(grep -E '^versionCode=' module/module.prop | cut -d= -f2 || echo 125)
           fi
 
           echo "MOD_VER=${MOD_VER}" >> "$GITHUB_ENV"

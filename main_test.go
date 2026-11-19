@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDecodeBase64Flexible(t *testing.T) {
@@ -2634,5 +2637,331 @@ func TestDownloadAndApiGeoUpdate(t *testing.T) {
 	}
 	if st.Geo.GeoIPURL != server.URL+"/geoip.dat" {
 		t.Errorf("unexpected GeoIPURL: %s", st.Geo.GeoIPURL)
+	}
+}
+
+func TestApiNodesEditAction(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersist := PersistStateFile
+	defer func() {
+		StateFile = origState
+		PersistStateFile = origPersist
+		invalidateStateCache()
+	}()
+
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+	invalidateStateCache()
+
+	node, err := parseShareURI("vless://11111111-2222-3333-4444-555555555555@example.com:443?encryption=none&security=reality&sni=orig.sni.com&fp=chrome&pbk=12345&sid=abcdef&type=tcp#TestNode", "manual")
+	if err != nil {
+		t.Fatalf("failed to parse initial share URI: %v", err)
+	}
+	st := loadState()
+	st.Nodes = []NodeProfile{node}
+	st.ActiveNode = node.ID
+	if err := saveState(st); err != nil {
+		t.Fatalf("failed to save initial state: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
+		st := loadState()
+		var req struct {
+			Action  string `json:"action"`
+			URI     string `json:"uri"`
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			Address string `json:"address"`
+			Port    int    `json:"port"`
+			SNI     string `json:"sni"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Action {
+		case "edit", "update":
+			foundIdx := -1
+			for i := range st.Nodes {
+				if st.Nodes[i].ID == req.ID {
+					foundIdx = i
+					break
+				}
+			}
+			if foundIdx == -1 {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "node not found"})
+				return
+			}
+			if strings.TrimSpace(req.URI) != "" {
+				parsed, err := parseShareURI(req.URI, st.Nodes[foundIdx].Group)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+				parsed.ID = st.Nodes[foundIdx].ID
+				if strings.TrimSpace(req.Name) != "" {
+					parsed.Name = strings.TrimSpace(req.Name)
+				}
+				st.Nodes[foundIdx] = parsed
+			} else {
+				if strings.TrimSpace(req.Name) != "" {
+					st.Nodes[foundIdx].Name = strings.TrimSpace(req.Name)
+				}
+				if strings.TrimSpace(req.Address) != "" {
+					st.Nodes[foundIdx].Address = strings.TrimSpace(req.Address)
+				}
+				if req.Port > 0 && req.Port <= 65535 {
+					st.Nodes[foundIdx].Port = req.Port
+				}
+				updateNodeOutboundAddressAndPort(&st.Nodes[foundIdx], strings.TrimSpace(req.Address), req.Port, strings.TrimSpace(req.SNI))
+			}
+			_ = saveState(st)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// 1. Edit Name, Address, Port, SNI
+	editBody := map[string]interface{}{
+		"action":  "edit",
+		"id":      node.ID,
+		"name":    "Updated-Node-Alias",
+		"address": "new-server.org",
+		"port":    8443,
+		"sni":     "new.sni.com",
+	}
+	bodyBytes, _ := json.Marshal(editBody)
+	req := httptest.NewRequest(http.MethodPost, "/api/nodes", bytes.NewReader(bodyBytes))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on node edit, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	stAfter := loadState()
+	if len(stAfter.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(stAfter.Nodes))
+	}
+	updated := stAfter.Nodes[0]
+	if updated.Name != "Updated-Node-Alias" {
+		t.Errorf("expected updated name, got %s", updated.Name)
+	}
+	if updated.Address != "new-server.org" {
+		t.Errorf("expected updated address, got %s", updated.Address)
+	}
+	if updated.Port != 8443 {
+		t.Errorf("expected updated port 8443, got %d", updated.Port)
+	}
+
+	settings, _ := updated.Outbound["settings"].(map[string]interface{})
+	vnext, _ := settings["vnext"].([]interface{})
+	vObj, _ := vnext[0].(map[string]interface{})
+	if vObj["address"] != "new-server.org" || vObj["port"] != 8443 {
+		t.Errorf("expected outbound vnext to be updated, got: %v", vObj)
+	}
+
+	ss, _ := updated.Outbound["streamSettings"].(map[string]interface{})
+	reality, _ := ss["realitySettings"].(map[string]interface{})
+	if reality["serverName"] != "new.sni.com" {
+		t.Errorf("expected reality serverName to be updated, got: %v", reality)
+	}
+
+	// 2. Edit non-existent node returns 404
+	badBody := map[string]interface{}{
+		"action": "edit",
+		"id":     "non-existent-id",
+		"name":   "Bad",
+	}
+	badBytes, _ := json.Marshal(badBody)
+	reqBad := httptest.NewRequest(http.MethodPost, "/api/nodes", bytes.NewReader(badBytes))
+	rrBad := httptest.NewRecorder()
+	mux.ServeHTTP(rrBad, reqBad)
+	if rrBad.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for missing node, got %d", rrBad.Code)
+	}
+}
+
+func TestApiLogsDownload(t *testing.T) {
+	tmpDir := t.TempDir()
+	origLog := LogFile
+	defer func() { LogFile = origLog }()
+
+	LogFile = filepath.Join(tmpDir, "test.log")
+	logContent := "2026-11-20 00:00:01 [info] passwall started\n2026-11-20 00:00:02 [info] connected to proxy\n"
+	if err := os.WriteFile(LogFile, []byte(logContent), 0644); err != nil {
+		t.Fatalf("failed to write mock log: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("download") == "1" || r.URL.Query().Get("download") == "true" {
+			data, err := os.ReadFile(LogFile)
+			if err != nil {
+				data = []byte("No logs recorded yet.\n")
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"passwall-runtime-%s.log\"", time.Now().Format("20060102-150405")))
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			_, _ = w.Write(data)
+			return
+		}
+		data, _ := os.ReadFile(LogFile)
+		_, _ = w.Write(data)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/logs?download=1", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rr.Code)
+	}
+	disp := rr.Header().Get("Content-Disposition")
+	if !strings.Contains(disp, "attachment; filename=\"passwall-runtime-") {
+		t.Errorf("unexpected Content-Disposition header: %s", disp)
+	}
+	if rr.Body.String() != logContent {
+		t.Errorf("downloaded logs mismatch: got %q, want %q", rr.Body.String(), logContent)
+	}
+}
+
+func TestApiStatusResourceMetricsAndBattery(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	defer func() {
+		StateFile = origState
+		invalidateStateCache()
+	}()
+	StateFile = filepath.Join(tmpDir, "state.json")
+	invalidateStateCache()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		daemonPID := os.Getpid()
+		currentXrayPID := getXrayPID()
+		batPct, batStatus := getBatteryStatus()
+		modCPU := getProcessCPU(daemonPID)
+		modRAMBytes, modRAMStr := getProcessRAM(daemonPID)
+
+		var xrayCPU float64
+		var xrayRAMBytes int64
+		var xrayRAMStr string = "0 B"
+		if currentXrayPID > 0 {
+			xrayCPU = getProcessCPU(currentXrayPID)
+			xrayRAMBytes, xrayRAMStr = getProcessRAM(currentXrayPID)
+		}
+
+		resp := map[string]interface{}{
+			"running":        true,
+			"daemon_pid":     daemonPID,
+			"battery_pct":    batPct,
+			"battery_status": batStatus,
+			"module_pid":     daemonPID,
+			"module_cpu":     modCPU,
+			"module_ram":     modRAMBytes,
+			"module_ram_str": modRAMStr,
+			"xray_pid":       currentXrayPID,
+			"xray_cpu":       xrayCPU,
+			"xray_ram":       xrayRAMBytes,
+			"xray_ram_str":   xrayRAMStr,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rr.Code)
+	}
+
+	var res map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &res); err != nil {
+		t.Fatalf("json unmarshal failed: %v", err)
+	}
+
+	if _, ok := res["battery_pct"]; !ok {
+		t.Error("expected battery_pct field in status response")
+	}
+	if _, ok := res["module_cpu"]; !ok {
+		t.Error("expected module_cpu field in status response")
+	}
+	if _, ok := res["module_ram_str"]; !ok {
+		t.Error("expected module_ram_str field in status response")
+	}
+	if _, ok := res["xray_cpu"]; !ok {
+		t.Error("expected xray_cpu field in status response")
+	}
+	if _, ok := res["xray_ram_str"]; !ok {
+		t.Error("expected xray_ram_str field in status response")
+	}
+}
+
+func TestWriteSysctlOptimization(t *testing.T) {
+	tmpDir := t.TempDir()
+	sysctlPath := filepath.Join(tmpDir, "ip_forward")
+
+	writeSysctl(sysctlPath, "1")
+	data, err := os.ReadFile(sysctlPath)
+	if err != nil || strings.TrimSpace(string(data)) != "1" {
+		t.Fatalf("expected initial write to be 1, got %s, err %v", string(data), err)
+	}
+
+	stat1, err := os.Stat(sysctlPath)
+	if err != nil {
+		t.Fatalf("stat failed: %v", err)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+
+	writeSysctl(sysctlPath, "1")
+	stat2, err := os.Stat(sysctlPath)
+	if err != nil {
+		t.Fatalf("stat failed: %v", err)
+	}
+	if !stat1.ModTime().Equal(stat2.ModTime()) {
+		t.Errorf("expected writeSysctl with identical value to skip write, modtime changed from %v to %v", stat1.ModTime(), stat2.ModTime())
+	}
+
+	writeSysctl(sysctlPath, "0")
+	data2, _ := os.ReadFile(sysctlPath)
+	if strings.TrimSpace(string(data2)) != "0" {
+		t.Errorf("expected updated value 0, got %s", string(data2))
+	}
+}
+
+func TestWebUIStatusTabAndEditModalElements(t *testing.T) {
+	checks := []string{
+		`id="t-status" onclick="showTab('status')">Status</div>`,
+		`id="p-status" class="card"`,
+		`id="statBattery"`,
+		`id="statModule"`,
+		`id="statXray"`,
+		`id="statCardBattery"`,
+		`id="statCardModuleCPU"`,
+		`id="statCardXrayCPU"`,
+		`id="nodeEditModal" class="modal-bg hidden"`,
+		`id="editNodeName"`,
+		`id="editNodeAddress"`,
+		`id="editNodePort"`,
+		`function openEditNode(`,
+		`function closeEditNode()`,
+		`function saveEditNode()`,
+		`function downloadLogs()`,
+		`document.addEventListener("visibilitychange"`,
+		`Rule`,
+	}
+
+	for _, str := range checks {
+		if !strings.Contains(dashboardHTML, str) {
+			t.Errorf("dashboardHTML missing expected element: %s", str)
+		}
 	}
 }

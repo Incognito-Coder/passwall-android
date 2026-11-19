@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -35,7 +36,7 @@ var (
 	PidFile       = "/dev/passwall-droid.pid"
 	PackagesFile  = "/data/system/packages.list"
 	WebListenAddr = "0.0.0.0:9090"
-	AppVersion    = "v1.2.4"
+	AppVersion    = "v1.2.5"
 
 	PersistDir        = "/data/adb/passwall"
 	PersistBaseConfig = PersistDir + "/config.json"
@@ -339,31 +340,280 @@ func runCmdIgnoreErr(name string, args ...string) {
 }
 
 func writeSysctl(path, val string) {
+	if data, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(data)) == strings.TrimSpace(val) {
+		return
+	}
 	_ = os.WriteFile(path, []byte(val), 0644)
 }
 
 var (
-	xrayVerMu     sync.Mutex
-	cachedXrayVer string
+	xrayVerMu         sync.Mutex
+	cachedXrayVer     string
+	modVerMu          sync.Mutex
+	cachedModVer      string
+	lastModPropPath   string
+	lastModPropTime   time.Time
+	lastModPropAppVer string
+	xrayPidMu         sync.Mutex
+	xrayPid           int
 )
 
+func setXrayPID(pid int) {
+	xrayPidMu.Lock()
+	xrayPid = pid
+	xrayPidMu.Unlock()
+}
+
+func getXrayPID() int {
+	xrayPidMu.Lock()
+	defer xrayPidMu.Unlock()
+	return xrayPid
+}
+
 func getModuleVersion() string {
+	modVerMu.Lock()
+	defer modVerMu.Unlock()
+
 	propFile := filepath.Join(BaseDir, "module.prop")
-	if data, err := os.ReadFile(propFile); err == nil {
+	stat, err := os.Stat(propFile)
+
+	if cachedModVer != "" && lastModPropPath == propFile && lastModPropAppVer == AppVersion {
+		if (err != nil && lastModPropTime.IsZero()) || (err == nil && stat.ModTime().Equal(lastModPropTime)) {
+			return cachedModVer
+		}
+	}
+
+	lastModPropPath = propFile
+	lastModPropAppVer = AppVersion
+	if err == nil {
+		lastModPropTime = stat.ModTime()
+		if data, err := os.ReadFile(propFile); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "version=") {
+					ver := strings.TrimPrefix(line, "version=")
+					if ver != "" {
+						cachedModVer = ver
+						return cachedModVer
+					}
+				}
+			}
+		}
+	} else {
+		lastModPropTime = time.Time{}
+	}
+
+	if AppVersion != "" {
+		cachedModVer = AppVersion
+		return cachedModVer
+	}
+	cachedModVer = "v1.2.1"
+	return cachedModVer
+}
+
+func invalidateModuleVersion() {
+	modVerMu.Lock()
+	cachedModVer = ""
+	lastModPropTime = time.Time{}
+	modVerMu.Unlock()
+}
+
+func getBatteryStatus() (int, string) {
+	paths := []string{
+		"/sys/class/power_supply/battery",
+		"/sys/class/power_supply/bms",
+	}
+	if matches, err := filepath.Glob("/sys/class/power_supply/*"); err == nil {
+		for _, m := range matches {
+			found := false
+			for _, p := range paths {
+				if p == m {
+					found = true
+					break
+				}
+			}
+			if !found {
+				paths = append(paths, m)
+			}
+		}
+	}
+
+	for _, p := range paths {
+		capFile := filepath.Join(p, "capacity")
+		if data, err := os.ReadFile(capFile); err == nil {
+			trimmed := strings.TrimSpace(string(data))
+			if val, err := strconv.Atoi(trimmed); err == nil && val >= 0 && val <= 100 {
+				status := ""
+				if statData, err := os.ReadFile(filepath.Join(p, "status")); err == nil {
+					status = strings.TrimSpace(string(statData))
+				}
+				return val, status
+			}
+		}
+	}
+	return -1, ""
+}
+
+func getProcessRAM(pid int) (int64, string) {
+	if pid <= 0 {
+		return 0, "0 B"
+	}
+	statmPath := fmt.Sprintf("/proc/%d/statm", pid)
+	if data, err := os.ReadFile(statmPath); err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) >= 2 {
+			if pages, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+				b := pages * int64(os.Getpagesize())
+				return b, formatBytes(b)
+			}
+		}
+	}
+	statusPath := fmt.Sprintf("/proc/%d/status", pid)
+	if data, err := os.ReadFile(statusPath); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "version=") {
-				ver := strings.TrimPrefix(line, "version=")
-				if ver != "" {
-					return ver
+			if strings.HasPrefix(line, "VmRSS:") {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+						b := kb * 1024
+						return b, formatBytes(b)
+					}
 				}
 			}
 		}
 	}
-	if AppVersion != "" {
-		return AppVersion
+	return 0, "0 B"
+}
+
+type procCPUSample struct {
+	utime uint64
+	stime uint64
+	sys   uint64
+	time  time.Time
+}
+
+var (
+	cpuSampleMu    sync.Mutex
+	lastCPUSamples = make(map[int]procCPUSample)
+)
+
+func getProcessCPU(pid int) float64 {
+	if pid <= 0 {
+		return 0.0
 	}
-	return "v1.2.1"
+	statData, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0.0
+	}
+	statStr := string(statData)
+	lastRP := strings.LastIndex(statStr, ")")
+	if lastRP == -1 || lastRP+2 >= len(statStr) {
+		return 0.0
+	}
+	fields := strings.Fields(statStr[lastRP+2:])
+	if len(fields) < 13 {
+		return 0.0
+	}
+	utime, err1 := strconv.ParseUint(fields[11], 10, 64)
+	stime, err2 := strconv.ParseUint(fields[12], 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0.0
+	}
+
+	var totalSys uint64
+	if sysData, err := os.ReadFile("/proc/stat"); err == nil {
+		lines := strings.Split(string(sysData), "\n")
+		for _, l := range lines {
+			if strings.HasPrefix(l, "cpu ") {
+				nums := strings.Fields(l)[1:]
+				for _, nStr := range nums {
+					if nVal, err := strconv.ParseUint(nStr, 10, 64); err == nil {
+						totalSys += nVal
+					}
+				}
+				break
+			}
+		}
+	}
+
+	now := time.Now()
+	cpuSampleMu.Lock()
+	defer cpuSampleMu.Unlock()
+
+	prev, exists := lastCPUSamples[pid]
+	lastCPUSamples[pid] = procCPUSample{
+		utime: utime,
+		stime: stime,
+		sys:   totalSys,
+		time:  now,
+	}
+
+	if !exists {
+		return 0.0
+	}
+
+	procDelta := float64((utime + stime) - (prev.utime + prev.stime))
+	if procDelta < 0 {
+		procDelta = 0
+	}
+
+	if totalSys > prev.sys && prev.sys > 0 {
+		sysDelta := float64(totalSys - prev.sys)
+		if sysDelta > 0 {
+			pct := (procDelta / sysDelta) * 100.0
+			return math.Round(pct*10) / 10
+		}
+	}
+
+	elapsed := now.Sub(prev.time).Seconds()
+	if elapsed > 0.1 {
+		pct := (procDelta / 100.0 / elapsed) * 100.0
+		if pct > 100.0 {
+			pct = 100.0
+		}
+		return math.Round(pct*10) / 10
+	}
+
+	return 0.0
+}
+
+func updateNodeOutboundAddressAndPort(node *NodeProfile, newAddr string, newPort int, newSNI string) {
+	if node.Outbound == nil {
+		node.Outbound = make(map[string]interface{})
+	}
+	settings, ok := node.Outbound["settings"].(map[string]interface{})
+	if ok && settings != nil {
+		if vnext, ok := settings["vnext"].([]interface{}); ok && len(vnext) > 0 {
+			if vObj, ok := vnext[0].(map[string]interface{}); ok {
+				if newAddr != "" {
+					vObj["address"] = newAddr
+				}
+				if newPort > 0 {
+					vObj["port"] = newPort
+				}
+			}
+		}
+		if servers, ok := settings["servers"].([]interface{}); ok && len(servers) > 0 {
+			if sObj, ok := servers[0].(map[string]interface{}); ok {
+				if newAddr != "" {
+					sObj["address"] = newAddr
+				}
+				if newPort > 0 {
+					sObj["port"] = newPort
+				}
+			}
+		}
+	}
+	if newSNI != "" {
+		if ss, ok := node.Outbound["streamSettings"].(map[string]interface{}); ok && ss != nil {
+			if tlsSettings, ok := ss["tlsSettings"].(map[string]interface{}); ok && tlsSettings != nil {
+				tlsSettings["serverName"] = newSNI
+			}
+			if realitySettings, ok := ss["realitySettings"].(map[string]interface{}); ok && realitySettings != nil {
+				realitySettings["serverName"] = newSNI
+			}
+		}
+	}
 }
 
 func getXrayVersion() string {
@@ -531,9 +781,35 @@ func resetBaseConfig() error {
 	return nil
 }
 
+var (
+	cachedState        PanelState
+	cachedStateValid   bool
+	lastStateModTime   time.Time
+	lastPersistModTime time.Time
+	lastStatePath      string
+	lastPersistPath    string
+)
+
+func invalidateStateCache() {
+	stateMu.Lock()
+	cachedStateValid = false
+	stateMu.Unlock()
+}
+
 func loadState() PanelState {
 	stateMu.Lock()
 	defer stateMu.Unlock()
+
+	statState, errState := os.Stat(StateFile)
+	statPersist, errPersist := os.Stat(PersistStateFile)
+
+	if cachedStateValid && lastStatePath == StateFile && lastPersistPath == PersistStateFile {
+		stateUnchanged := (errState != nil && lastStateModTime.IsZero()) || (errState == nil && statState.ModTime().Equal(lastStateModTime))
+		persistUnchanged := (errPersist != nil && lastPersistModTime.IsZero()) || (errPersist == nil && statPersist.ModTime().Equal(lastPersistModTime))
+		if stateUnchanged && persistUnchanged {
+			return cachedState
+		}
+	}
 
 	st := PanelState{
 		ProxyMode:      "rule",
@@ -656,6 +932,21 @@ func loadState() PanelState {
 		st.Geo.GeoSiteURL = "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geosite.dat"
 	}
 
+	cachedState = st
+	cachedStateValid = true
+	lastStatePath = StateFile
+	lastPersistPath = PersistStateFile
+	if errState == nil && statState != nil {
+		lastStateModTime = statState.ModTime()
+	} else {
+		lastStateModTime = time.Time{}
+	}
+	if errPersist == nil && statPersist != nil {
+		lastPersistModTime = statPersist.ModTime()
+	} else {
+		lastPersistModTime = time.Time{}
+	}
+
 	return st
 }
 
@@ -672,6 +963,22 @@ func saveState(st PanelState) error {
 	if err1 != nil && err2 != nil {
 		return err1
 	}
+
+	cachedState = st
+	cachedStateValid = true
+	lastStatePath = StateFile
+	lastPersistPath = PersistStateFile
+	if s, err := os.Stat(StateFile); err == nil {
+		lastStateModTime = s.ModTime()
+	} else {
+		lastStateModTime = time.Time{}
+	}
+	if s, err := os.Stat(PersistStateFile); err == nil {
+		lastPersistModTime = s.ModTime()
+	} else {
+		lastPersistModTime = time.Time{}
+	}
+
 	return nil
 }
 
@@ -1825,8 +2132,8 @@ func superviseXray(stopCh <-chan struct{}, doneCh chan<- struct{}) {
 			"xray.location.asset="+assetDir,
 			"V2RAY_LOCATION_ASSET="+assetDir,
 			"v2ray.location.asset="+assetDir,
-			"GOGC=40",
-			"GOMEMLIMIT=48MiB",
+			"GOGC=80",
+			"GOMEMLIMIT=128MiB",
 		)
 		cmd.Stdout = logSink
 		cmd.Stderr = logSink
@@ -1838,6 +2145,7 @@ func superviseXray(stopCh <-chan struct{}, doneCh chan<- struct{}) {
 			time.Sleep(3 * time.Second)
 			continue
 		}
+		setXrayPID(cmd.Process.Pid)
 
 		waitCh := make(chan error, 1)
 		go func() {
@@ -1853,8 +2161,10 @@ func superviseXray(stopCh <-chan struct{}, doneCh chan<- struct{}) {
 			case <-time.After(3 * time.Second):
 				_ = cmd.Process.Kill()
 			}
+			setXrayPID(0)
 			return
 		case err := <-waitCh:
+			setXrayPID(0)
 			log.Printf("[passwall-droid] xray exited (%v); restarting in 2s...", err)
 			time.Sleep(2 * time.Second)
 		}
@@ -1916,6 +2226,7 @@ func stopProxyEngine() {
 
 	close(xrayStopCh)
 	<-xrayDoneCh
+	setXrayPID(0)
 	cleanupIptables()
 	cleanupPolicyRouting()
 	engineActive = false
@@ -1929,7 +2240,7 @@ func restartProxyEngine() error {
 }
 
 func watchdogLoop() {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -2747,9 +3058,25 @@ func startWebDashboard() {
 		if tproxy {
 			netMode = "TPROXY (mangle)"
 		}
+
+		daemonPID := os.Getpid()
+		currentXrayPID := getXrayPID()
+
+		batPct, batStatus := getBatteryStatus()
+		modCPU := getProcessCPU(daemonPID)
+		modRAMBytes, modRAMStr := getProcessRAM(daemonPID)
+
+		var xrayCPU float64
+		var xrayRAMBytes int64
+		var xrayRAMStr string = "0 B"
+		if currentXrayPID > 0 {
+			xrayCPU = getProcessCPU(currentXrayPID)
+			xrayRAMBytes, xrayRAMStr = getProcessRAM(currentXrayPID)
+		}
+
 		resp := map[string]interface{}{
 			"running":           active,
-			"daemon_pid":        os.Getpid(),
+			"daemon_pid":        daemonPID,
 			"net_mode":          netMode,
 			"proxy_mode":        st.ProxyMode,
 			"active_node":       st.ActiveNode,
@@ -2765,6 +3092,16 @@ func startWebDashboard() {
 			"module_version":    getModuleVersion(),
 			"xray_version":      getXrayVersion(),
 			"nodes":             st.Nodes,
+			"battery_pct":       batPct,
+			"battery_status":    batStatus,
+			"module_pid":        daemonPID,
+			"module_cpu":        modCPU,
+			"module_ram":        modRAMBytes,
+			"module_ram_str":    modRAMStr,
+			"xray_pid":          currentXrayPID,
+			"xray_cpu":          xrayCPU,
+			"xray_ram":          xrayRAMBytes,
+			"xray_ram_str":      xrayRAMStr,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -3071,9 +3408,13 @@ func startWebDashboard() {
 		}
 		st := loadState()
 		var req struct {
-			Action string `json:"action"` // "import", "select", "delete"
-			URI    string `json:"uri"`
-			ID     string `json:"id"`
+			Action  string `json:"action"` // "import", "select", "delete", "edit", "update"
+			URI     string `json:"uri"`
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			Address string `json:"address"`
+			Port    int    `json:"port"`
+			SNI     string `json:"sni"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -3093,6 +3434,50 @@ func startWebDashboard() {
 			_ = saveState(st)
 			log.Printf("[passwall-droid] imported manual node: %s (%s:%d)", node.Name, node.Address, node.Port)
 			_ = restartProxyEngine()
+		case "edit", "update":
+			foundIdx := -1
+			for i := range st.Nodes {
+				if st.Nodes[i].ID == req.ID {
+					foundIdx = i
+					break
+				}
+			}
+			if foundIdx == -1 {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "node not found"})
+				return
+			}
+
+			if strings.TrimSpace(req.URI) != "" {
+				parsed, err := parseShareURI(req.URI, st.Nodes[foundIdx].Group)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+				parsed.ID = st.Nodes[foundIdx].ID
+				if strings.TrimSpace(req.Name) != "" {
+					parsed.Name = strings.TrimSpace(req.Name)
+				}
+				st.Nodes[foundIdx] = parsed
+			} else {
+				if strings.TrimSpace(req.Name) != "" {
+					st.Nodes[foundIdx].Name = strings.TrimSpace(req.Name)
+				}
+				if strings.TrimSpace(req.Address) != "" {
+					st.Nodes[foundIdx].Address = strings.TrimSpace(req.Address)
+				}
+				if req.Port > 0 && req.Port <= 65535 {
+					st.Nodes[foundIdx].Port = req.Port
+				}
+				updateNodeOutboundAddressAndPort(&st.Nodes[foundIdx], strings.TrimSpace(req.Address), req.Port, strings.TrimSpace(req.SNI))
+			}
+
+			_ = saveState(st)
+			log.Printf("[passwall-droid] updated node: %s (%s, %s:%d)", st.Nodes[foundIdx].ID, st.Nodes[foundIdx].Name, st.Nodes[foundIdx].Address, st.Nodes[foundIdx].Port)
+			if st.ActiveNode == req.ID {
+				_ = restartProxyEngine()
+			}
 		case "select":
 			st.ActiveNode = req.ID
 			_ = saveState(st)
@@ -3223,6 +3608,17 @@ func startWebDashboard() {
 			_ = os.WriteFile(LogFile, []byte(""), 0644)
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "cleared"})
+			return
+		}
+		if r.URL.Query().Get("download") == "1" || r.URL.Query().Get("download") == "true" {
+			data, err := os.ReadFile(LogFile)
+			if err != nil {
+				data = []byte("No logs recorded yet.\n")
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"passwall-runtime-%s.log\"", time.Now().Format("20060102-150405")))
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			_, _ = w.Write(data)
 			return
 		}
 		data, err := os.ReadFile(LogFile)
@@ -3426,6 +3822,12 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;border-radius:7p
 pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;font-size:11px;color:#cbd5e1;overflow-x:auto;max-height:320px;white-space:pre-wrap;word-break:break-all}
 .msg{font-size:12px;color:#38bdf8;margin-top:6px;min-height:16px}
 .hidden{display:none}
+.modal-bg{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:999;padding:12px}
+.modal-card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px;width:100%;max-width:440px;box-sizing:border-box}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:10px}
+.stat-box{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px}
+.stat-val{font-size:13px;font-weight:700;color:#38bdf8;margin-top:2px}
+.stat-lbl{font-size:11px;color:#94a3b8}
 </style>
 </head>
 <body>
@@ -3439,6 +3841,11 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
     <span id="statusBadge" class="badge off">LOADING</span>
   </div>
   <div class="meta" id="metaLine">Xray: -- | Netfilter: -- | PID: --</div>
+  <div class="row" style="margin-bottom:8px;gap:6px;font-size:11px">
+    <span id="statBattery" class="conn-pill" style="height:22px;min-height:22px;background:#0f172a;border:1px solid #334155">🔋 Battery: --</span>
+    <span id="statModule" class="conn-pill" style="height:22px;min-height:22px;background:#0f172a;border:1px solid #334155">Module: --</span>
+    <span id="statXray" class="conn-pill" style="height:22px;min-height:22px;background:#0f172a;border:1px solid #334155">Xray: --</span>
+  </div>
   <div class="conn-bar">
     <span style="font-size:12px;color:#94a3b8;font-weight:600">Connectivity:</span>
     <span id="connGoogle" class="conn-pill">Google: --</span>
@@ -3456,7 +3863,7 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 <div class="card">
   <div class="title" style="font-size:13px;margin-bottom:6px">Routing Mode</div>
   <div class="row" style="margin-bottom:8px">
-    <button id="mode-rule" style="flex:1" onclick="setMode('rule')">Rule (Bypass IR)</button>
+    <button id="mode-rule" style="flex:1;padding:0 4px;white-space:nowrap;font-size:11.5px" onclick="setMode('rule')">Rule</button>
     <button id="mode-global" style="flex:1" onclick="setMode('global')">Global</button>
     <button id="mode-direct" style="flex:1" onclick="setMode('direct')">Direct</button>
   </div>
@@ -3469,7 +3876,8 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 </div>
 
 <div class="tabs">
-  <div class="tab active" id="t-nodes" onclick="showTab('nodes')">Nodes &amp; Sub</div>
+  <div class="tab active" id="t-status" onclick="showTab('status')">Status</div>
+  <div class="tab" id="t-nodes" onclick="showTab('nodes')">Nodes &amp; Sub</div>
   <div class="tab" id="t-dns" onclick="showTab('dns')">DNS</div>
   <div class="tab" id="t-geo" onclick="showTab('geo')">Geo Rules</div>
   <div class="tab" id="t-apps" onclick="showTab('apps')">Apps</div>
@@ -3477,7 +3885,38 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
   <div class="tab" id="t-logs" onclick="showTab('logs')">Logs</div>
 </div>
 
-<div id="p-nodes" class="card">
+<div id="p-status" class="card">
+  <div class="title" style="font-size:13px;margin-bottom:8px">System &amp; Resource Status</div>
+  <div class="stat-grid">
+    <div class="stat-box">
+      <div class="stat-lbl">Device Battery</div>
+      <div class="stat-val" id="statCardBattery">--</div>
+      <div class="stat-lbl" id="statCardBatteryStatus">Status: --</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-lbl">Passwall Module</div>
+      <div class="stat-val" id="statCardModuleCPU">CPU: --</div>
+      <div class="stat-lbl" id="statCardModuleRAM">RAM: --</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-lbl">Xray Core</div>
+      <div class="stat-val" id="statCardXrayCPU">CPU: --</div>
+      <div class="stat-lbl" id="statCardXrayRAM">RAM: --</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-lbl">Active Core PIDs</div>
+      <div class="stat-val" id="statCardPIDs">--</div>
+      <div class="stat-lbl" id="statCardNetMode">Mode: --</div>
+    </div>
+  </div>
+
+  <div style="background:#0f172a;border:1px solid #334155;border-radius:8px;padding:10px;margin-bottom:8px">
+    <div style="font-size:12px;font-weight:700;margin-bottom:4px;color:#f8fafc">Active Proxy Node Connection</div>
+    <div id="statCardActiveNode" style="font-size:12px;color:#cbd5e1">No proxy node currently active</div>
+  </div>
+</div>
+
+<div id="p-nodes" class="card hidden">
   <div class="title" style="font-size:13px;margin-bottom:6px">Subscription URL (Direct WAN Fetch)</div>
   <input id="subUrlInput" type="text" placeholder="https://example.com/sub/...">
   <div class="row" style="margin-bottom:8px">
@@ -3554,7 +3993,7 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
     
     <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;color:#cbd5e1;cursor:pointer;margin-bottom:8px">
       <input id="geoBypassIranChk" type="checkbox" style="width:18px;height:18px;margin:2px 0 0 0">
-      <span><b>Bypass Iran Domestic Traffic (domain:ir, geosite:ir, geoip:ir)</b><span class="node-sub" style="display:block">Directly routes Iranian national websites, payment gateways, and banking services without proxy.</span></span>
+      <span><b>Bypass Iran Domestic Traffic (domain:ir, geosite:ir, geosite:category-ir, geoip:ir)</b><span class="node-sub" style="display:block">Directly routes Iranian national websites, payment gateways, and banking services without proxy.</span></span>
     </label>
 
     <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;color:#cbd5e1;cursor:pointer;margin-bottom:8px">
@@ -3649,9 +4088,36 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 <div id="p-logs" class="card hidden">
   <div class="header">
     <div class="title" style="font-size:13px">Runtime Logs</div>
-    <button class="btn-red btn-sm" onclick="clearLogs()">Clear</button>
+    <div class="row">
+      <button class="btn-blue btn-sm" onclick="downloadLogs()">Download</button>
+      <button class="btn-red btn-sm" onclick="clearLogs()">Clear</button>
+    </div>
   </div>
   <pre id="logBox">Loading logs...</pre>
+</div>
+
+<div id="nodeEditModal" class="modal-bg hidden">
+  <div class="modal-card">
+    <div class="header" style="margin-bottom:10px">
+      <div class="title" style="font-size:14px">Edit Proxy Node</div>
+      <button class="btn-sm" onclick="closeEditNode()">✕</button>
+    </div>
+    <input type="hidden" id="editNodeId">
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Node Name</div>
+    <input id="editNodeName" type="text" placeholder="Node Alias">
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Server Address</div>
+    <input id="editNodeAddress" type="text" placeholder="example.com or 1.2.3.4">
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Port</div>
+    <input id="editNodePort" type="number" min="1" max="65535" placeholder="443">
+    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">TLS / Reality SNI (Optional)</div>
+    <input id="editNodeSNI" type="text" placeholder="serverName / SNI (optional)">
+    <div style="font-size:12px;font-weight:600;margin:6px 0 4px;color:#cbd5e1">Replace from Share URI (Optional)</div>
+    <input id="editNodeURI" type="text" placeholder="vless://... or trojan://... (optional)">
+    <div class="row" style="margin-top:10px">
+      <button class="btn-green" style="flex:1" onclick="saveEditNode()">Save Changes</button>
+      <button style="flex:1" onclick="closeEditNode()">Cancel</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -3679,11 +4145,13 @@ function showMsg(txt) {
 }
 
 function showTab(name) {
-  var tabs = ["nodes", "dns", "geo", "apps", "config", "logs"];
+  var tabs = ["status", "nodes", "dns", "geo", "apps", "config", "logs"];
   for (var i = 0; i < tabs.length; i++) {
     var t = tabs[i];
-    document.getElementById("t-" + t).className = (t === name) ? "tab active" : "tab";
-    document.getElementById("p-" + t).className = (t === name) ? "card" : "card hidden";
+    var tabEl = document.getElementById("t-" + t);
+    var panelEl = document.getElementById("p-" + t);
+    if (tabEl) tabEl.className = (t === name) ? "tab active" : "tab";
+    if (panelEl) panelEl.className = (t === name) ? "card" : "card hidden";
   }
   if (name === "dns") { loadDNS(); }
   if (name === "geo") { loadGeo(); }
@@ -3898,6 +4366,57 @@ function refreshStatus() {
     document.getElementById("metaLine").innerHTML =
       "Xray: " + esc(d.xray_version || "Unknown") + " | Netfilter: " + esc(d.net_mode) + " | PID: " + d.daemon_pid;
 
+    // Battery & Resource Metrics
+    var batText = (typeof d.battery_pct === "number" && d.battery_pct >= 0) ? (d.battery_pct + "%") : "N/A";
+    var batStatus = d.battery_status ? (" (" + d.battery_status + ")") : "";
+    var elBat = document.getElementById("statBattery");
+    if (elBat) elBat.innerHTML = "🔋 Battery: " + batText + batStatus;
+    var elCardBat = document.getElementById("statCardBattery");
+    if (elCardBat) elCardBat.innerHTML = batText;
+    var elCardBatSt = document.getElementById("statCardBatteryStatus");
+    if (elCardBatSt) elCardBatSt.innerHTML = "Status: " + (d.battery_status || "Standard");
+
+    var modCPU = (typeof d.module_cpu === "number") ? (d.module_cpu.toFixed(1) + "%") : "--";
+    var modRAM = d.module_ram_str || "--";
+    var elMod = document.getElementById("statModule");
+    if (elMod) elMod.innerHTML = "Module: " + modCPU + " | " + modRAM;
+    var elCardModCPU = document.getElementById("statCardModuleCPU");
+    if (elCardModCPU) elCardModCPU.innerHTML = "CPU: " + modCPU;
+    var elCardModRAM = document.getElementById("statCardModuleRAM");
+    if (elCardModRAM) elCardModRAM.innerHTML = "RAM: " + modRAM + " (PID " + d.daemon_pid + ")";
+
+    var xrayRunning = (d.xray_pid > 0);
+    var xrayCPU = xrayRunning ? ((typeof d.xray_cpu === "number") ? (d.xray_cpu.toFixed(1) + "%") : "--") : "Stopped";
+    var xrayRAM = xrayRunning ? (d.xray_ram_str || "--") : "0 B";
+    var elXray = document.getElementById("statXray");
+    if (elXray) elXray.innerHTML = "Xray: " + xrayCPU + " | " + xrayRAM;
+    var elCardXrayCPU = document.getElementById("statCardXrayCPU");
+    if (elCardXrayCPU) elCardXrayCPU.innerHTML = "CPU: " + xrayCPU;
+    var elCardXrayRAM = document.getElementById("statCardXrayRAM");
+    if (elCardXrayRAM) elCardXrayRAM.innerHTML = "RAM: " + xrayRAM + (xrayRunning ? (" (PID " + d.xray_pid + ")") : "");
+
+    var elCardPIDs = document.getElementById("statCardPIDs");
+    if (elCardPIDs) elCardPIDs.innerHTML = "M:" + d.daemon_pid + " | X:" + (d.xray_pid || "--");
+    var elCardNet = document.getElementById("statCardNetMode");
+    if (elCardNet) elCardNet.innerHTML = esc(d.net_mode || "--");
+
+    var elCardNode = document.getElementById("statCardActiveNode");
+    if (elCardNode) {
+      var actNode = null;
+      var nds = d.nodes || [];
+      for (var ni = 0; ni < nds.length; ni++) {
+        if (nds[ni].id === d.active_node) { actNode = nds[ni]; break; }
+      }
+      if (actNode) {
+        var lat = (actNode.latency_ms > 0) ? (actNode.latency_ms + " ms") : "--";
+        elCardNode.innerHTML = "<b>" + esc(actNode.name) + "</b> &bull; " +
+          esc(actNode.protocol.toUpperCase()) + " &bull; " + esc(actNode.address) + ":" + actNode.port +
+          " &bull; Latency: " + lat;
+      } else {
+        elCardNode.innerHTML = '<span style="color:#f59e0b">No proxy node currently active</span>';
+      }
+    }
+
     var chk = document.getElementById("localhostProxyChk");
     if (chk) {
       chk.checked = (d.localhost_proxy !== false);
@@ -3933,6 +4452,7 @@ function refreshStatus() {
     document.getElementById("subMeta").innerHTML =
       "Last updated: " + (d.last_sub_update || "Never");
 
+    cachedNodes = d.nodes || [];
     renderNodes(d.nodes || [], d.active_node || "");
   });
 }
@@ -3962,6 +4482,7 @@ function renderNodes(nodes, activeId) {
       esc(n.protocol.toUpperCase()) + ' (' + esc(n.group || 'manual') + ') - ' + esc(n.address) + ':' + n.port + '</div></div>' +
       '<div class="row">' + latHtml +
       '<button class="btn-sm" onclick="pingOne(\'' + n.id + '\')">Ping</button>' +
+      '<button class="btn-blue btn-sm" onclick="openEditNode(\'' + esc(n.id) + '\')">Edit</button>' +
       (sel ? '' : '<button class="btn-blue btn-sm" onclick="nodeAct(\'select\',\'' + n.id + '\')">Use</button>') +
       '<button class="btn-red btn-sm" onclick="nodeAct(\'delete\',\'' + n.id + '\')">X</button>' +
       '</div></div>';
@@ -4139,11 +4660,89 @@ function clearLogs() {
   req("DELETE", "/api/logs", null, function() { loadLogs(); });
 }
 
+function downloadLogs() {
+  window.location.href = "/api/logs?download=1";
+}
+
+function openEditNode(id) {
+  var node = null;
+  for (var i = 0; i < cachedNodes.length; i++) {
+    if (cachedNodes[i].id === id) { node = cachedNodes[i]; break; }
+  }
+  if (!node) return;
+  document.getElementById("editNodeId").value = node.id;
+  document.getElementById("editNodeName").value = node.name || "";
+  document.getElementById("editNodeAddress").value = node.address || "";
+  document.getElementById("editNodePort").value = node.port || 443;
+  document.getElementById("editNodeURI").value = "";
+
+  var sni = "";
+  if (node.outbound && node.outbound.streamSettings) {
+    var ss = node.outbound.streamSettings;
+    if (ss.tlsSettings && ss.tlsSettings.serverName) {
+      sni = ss.tlsSettings.serverName;
+    } else if (ss.realitySettings && ss.realitySettings.serverName) {
+      sni = ss.realitySettings.serverName;
+    }
+  }
+  document.getElementById("editNodeSNI").value = sni;
+  document.getElementById("nodeEditModal").className = "modal-bg";
+}
+
+function closeEditNode() {
+  document.getElementById("nodeEditModal").className = "modal-bg hidden";
+}
+
+function saveEditNode() {
+  var id = document.getElementById("editNodeId").value;
+  var name = document.getElementById("editNodeName").value;
+  var addr = document.getElementById("editNodeAddress").value;
+  var port = parseInt(document.getElementById("editNodePort").value, 10) || 0;
+  var sni = document.getElementById("editNodeSNI").value;
+  var uri = document.getElementById("editNodeURI").value;
+
+  showMsg("Saving node changes...");
+  req("POST", "/api/nodes", {
+    action: "edit",
+    id: id,
+    name: name,
+    address: addr,
+    port: port,
+    sni: sni,
+    uri: uri
+  }, function(code, text) {
+    if (code === 200) {
+      closeEditNode();
+      showMsg("Node updated successfully.");
+      refreshStatus();
+    } else {
+      var err = text;
+      try { err = JSON.parse(text).error || text; } catch(e){}
+      showMsg("Error: " + err);
+    }
+  });
+}
+
+var pollTimer = null;
+function schedulePoll() {
+  if (pollTimer) clearTimeout(pollTimer);
+  var delay = document.hidden ? 30000 : 4000;
+  pollTimer = setTimeout(function() {
+    refreshStatus();
+    if (document.getElementById("p-logs").className === "card") { loadLogs(); }
+    schedulePoll();
+  }, delay);
+}
+document.addEventListener("visibilitychange", function() {
+  if (!document.hidden) {
+    refreshStatus();
+    if (document.getElementById("p-logs").className === "card") { loadLogs(); }
+  }
+  schedulePoll();
+});
+
 refreshStatus();
-setInterval(function() {
-  refreshStatus();
-  if (document.getElementById("p-logs").className === "card") { loadLogs(); }
-}, 4000);
+schedulePoll();
 </script>
 </body>
 </html>

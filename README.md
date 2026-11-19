@@ -17,6 +17,10 @@ OpenWrt Passwall-style transparent proxy module for Android 6.0 through Android 
 - **Embedded Web Control Panel (`http://127.0.0.1:9090` or `http://<phone-ip>:9090` on LAN):**
   - Switch routing modes (`Rule`, `Global`, `Direct`) with deadlock-free domain resolution for proxy nodes.
   - Dedicated **DNS Settings** tab: configure Remote DNS (`tcp://1.1.1.1`, `https://dns.google/dns-query`, etc.), Direct DNS (`223.5.5.5`, `10.202.10.202`, etc.), and Query Strategy (`UseIPv4`, `UseIP`, `UseIPv6`).
+  - **Status & Resource Monitor:** Dedicated **Status Tab** and live resource pills displaying real-time battery percentage & charging status, daemon CPU & RAM (RSS), and Xray-core CPU & RAM usage.
+  - **Edit Proxy Nodes:** Modify existing nodes on-the-fly (alias, server address, port, TLS/Reality SNI, or replace with an updated URI) with automatic hot-reload.
+  - **Download Runtime Logs:** One-click download of full system and Xray logs as timestamped `.log` files directly from the dashboard.
+  - **Battery & CPU Optimizations:** Tuned specifically for mobile endurance: 30s watchdog interval, sysctl write deduplication, in-memory state caching, Go GC tuning (`GOGC=80`, `GOMEMLIMIT=128MiB`), and Page Visibility API smart polling.
   - Dedicated **Geo Rules Settings** tab: toggle domestic bypass (Iran / China), ad-blocking (`geosite:category-ads-all`), configure custom Direct, Proxy, and Block domain & IP lists, inspect `geoip.dat` and `geosite.dat` status, and update geo assets on-the-fly over direct WAN.
   - Import `vless://` (including `xhttp`, `ws`, `grpc`, `tls`, `reality`), `trojan://`, `vmess://`, `ss://`, and `hysteria2://` / `hy2://` links.
   - Fetch Base64/plain subscription URLs over direct WAN (`SO_MARK 0x02000000`) with optional SSL/TLS certificate verification bypass and scheduled background auto-updates.
@@ -47,6 +51,7 @@ After flashing the module in **Magisk**, **KernelSU**, or **APatch** and rebooti
 The top card displays real-time daemon information and connectivity:
 - **Status Badge:** Displays `RUNNING` (green) when both `xray-core` and Netfilter interception rules are active, or `STOPPED` (red).
 - **Service Info:** Shows running Xray core version, Netfilter interception mode (`TPROXY (mangle)` on modern kernels or `REDIRECT (nat)` on legacy kernels), and the process PID.
+- **Resource Pills & Status Tab:** Real-time battery percentage (`🔋 85% Charging`), Passwall module CPU & RAM (RSS), and Xray-core CPU & RAM usage.
 - **Connectivity Monitor:** Tap **Check** to test live round-trip latency to **Google** (proxied WAN) and **GitHub** (direct/CDN).
 - **Service Controls:**
   - `Start`: Launches Xray-core and sets up transparent Netfilter routing.
@@ -79,8 +84,9 @@ Select your preferred traffic routing strategy:
     - `vmess://`
     - `ss://` (standard and legacy base64 formats)
     - `hysteria2://` / `hy2://`
-- **Testing & Node Switching:**
+- **Testing, Editing & Node Switching:**
   - Tap **Ping** next to any node to measure real-world round-trip time (ms).
+  - Tap **Edit** to modify node parameters (Alias name, Server host/IP, Port, TLS/Reality SNI, or paste a new Share URI).
   - Tap **Ping All** to test all imported nodes sequentially.
   - Tap **Fastest** to automatically test and switch to the lowest-latency reachable node.
   - Tap **Use** to make a specific node active immediately.
@@ -142,6 +148,7 @@ Control which Android applications route through Passwall:
 ### 9. Runtime Logs (`Logs` Tab)
 - Real-time output from `xray-core` and the `passwall-droid` background daemon.
 - Useful for diagnosing TLS handshake issues, routing decisions, and DNS interception.
+- Tap **Download** to save full runtime logs as timestamped `.log` files to your device.
 - Tap **Clear** to wipe the log buffer.
 </details>
 
