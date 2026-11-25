@@ -5,11 +5,17 @@ ui_print "- Detecting device CPU architecture: $ARCH"
 
 case "$ARCH" in
   arm)
+    if [ ! -f "$MODPATH/bin/arm/passwall-droid" ] || [ ! -f "$MODPATH/bin/arm/xray" ]; then
+      abort "! Missing ARMv7 binaries in this package (detected: $ARCH). Please install the universal or armeabi-v7a zip."
+    fi
     ui_print "- Installing ARMv7 (armeabi-v7a) binaries for Android 6+"
     cp -f "$MODPATH/bin/arm/passwall-droid" "$MODPATH/bin/passwall-droid"
     cp -f "$MODPATH/bin/arm/xray" "$MODPATH/bin/xray"
     ;;
   arm64)
+    if [ ! -f "$MODPATH/bin/arm64/passwall-droid" ] || [ ! -f "$MODPATH/bin/arm64/xray" ]; then
+      abort "! Missing ARM64 binaries in this package (detected: $ARCH). Please install the universal or arm64-v8a zip."
+    fi
     ui_print "- Installing ARM64 (arm64-v8a) binaries"
     cp -f "$MODPATH/bin/arm64/passwall-droid" "$MODPATH/bin/passwall-droid"
     cp -f "$MODPATH/bin/arm64/xray" "$MODPATH/bin/xray"

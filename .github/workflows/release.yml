@@ -56,7 +56,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Resolved Xray-core tag: $TAG"
 
-      - name: Build universal Magisk ZIP (ARMv7 + ARM64)
+      - name: Build Magisk ZIP packages (Universal + ARM64 + ARMv7)
         env:
           XRAY_VER: ${{ steps.xray.outputs.tag }}
           INPUT_MOD_VER: ${{ github.event.inputs.module_version }}
@@ -85,8 +85,8 @@ jobs:
           echo "MOD_CODE=${MOD_CODE}" >> "$GITHUB_ENV"
           echo "Building module version: ${MOD_VER} (versionCode: ${MOD_CODE})..."
           chmod +x build.sh
-          ./build.sh "${MOD_VER}" "${MOD_CODE}" "${XRAY_VER}"
-          sha256sum "passwall-android-${MOD_VER}-universal.zip" > "passwall-android-${MOD_VER}-universal.zip.sha256"
+          ./build.sh "${MOD_VER}" "${MOD_CODE}" "${XRAY_VER}" all
+          ls -lh "passwall-android-${MOD_VER}-"*.zip
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
@@ -98,3 +98,7 @@ jobs:
           files: |
             passwall-android-${{ env.MOD_VER }}-universal.zip
             passwall-android-${{ env.MOD_VER }}-universal.zip.sha256
+            passwall-android-${{ env.MOD_VER }}-arm64-v8a.zip
+            passwall-android-${{ env.MOD_VER }}-arm64-v8a.zip.sha256
+            passwall-android-${{ env.MOD_VER }}-armeabi-v7a.zip
+            passwall-android-${{ env.MOD_VER }}-armeabi-v7a.zip.sha256
