@@ -167,13 +167,13 @@ chmod +x build.sh
 ./build.sh
 
 # یا بیلد با مشخص کردن نسخه و versionCode دلخواه:
-./build.sh v1.2.5 125
+./build.sh v1.2.6 126
 
 # یا با متغیرهای محیطی:
-MOD_VERSION=v1.2.5 MOD_VERSION_CODE=125 ./build.sh
+MOD_VERSION=v1.2.6 MOD_VERSION_CODE=126 ./build.sh
 ```
 
-در هنگام ارسال تگ جدید به ریپازیتوری (مانند `git tag v1.2.5 && git push origin v1.2.5`)، اکشن گیت‌هاب به طور خودکار بیلد دوتایی ARMv7 و ARM64 را به همراه هسته Xray و دیتابیس‌های ژئو ساخته و فایل زیپ ماژول را در Release منتشر می‌کند.
+در هنگام ارسال تگ جدید به ریپازیتوری (مانند `git tag v1.2.6 && git push origin v1.2.6`)، اکشن گیت‌هاب به طور خودکار بیلد دوتایی ARMv7 و ARM64 را به همراه هسته Xray و دیتابیس‌های ژئو ساخته و فایل زیپ ماژول را در Release منتشر می‌کند.
 
 ---
 

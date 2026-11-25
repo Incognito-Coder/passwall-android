@@ -36,7 +36,7 @@ var (
 	PidFile       = "/dev/passwall-droid.pid"
 	PackagesFile  = "/data/system/packages.list"
 	WebListenAddr = "0.0.0.0:9090"
-	AppVersion    = "v1.2.5"
+	AppVersion    = "v1.2.6"
 
 	PersistDir        = "/data/adb/passwall"
 	PersistBaseConfig = PersistDir + "/config.json"
@@ -206,24 +206,118 @@ type NodeProfile struct {
 }
 
 type DNSConfig struct {
-	RemoteDNS     string `json:"remote_dns"`     // e.g. "tcp://1.1.1.1", "tcp://8.8.8.8", "https://dns.google/dns-query"
-	DirectDNS     string `json:"direct_dns"`     // e.g. "223.5.5.5", "10.202.10.202", "77.88.8.8"
-	QueryStrategy string `json:"query_strategy"` // "UseIPv4", "UseIP", "UseIPv6"
+	RemoteDNS           string `json:"remote_dns"`                      // e.g. "tcp://1.1.1.1", "tcp://8.8.8.8", "https://dns.google/dns-query"
+	DirectDNS           string `json:"direct_dns"`                      // e.g. "223.5.5.5", "10.202.10.202", "77.88.8.8"
+	QueryStrategy       string `json:"query_strategy"`                  // Legacy/combined strategy: "UseIPv4", "UseIP", "UseIPv6"
+	DirectQueryStrategy string `json:"direct_query_strategy,omitempty"` // "UseIP", "UseIPv4", "UseIPv6"
+	RemoteQueryStrategy string `json:"remote_query_strategy,omitempty"` // "UseIP", "UseIPv4", "UseIPv6"
+	DNSRedirect         *bool  `json:"dns_redirect,omitempty"`          // Redirect port 53 DNS and reject DoT port 853
+}
+
+func isValidQueryStrategy(s string) bool {
+	switch strings.TrimSpace(s) {
+	case "UseIP", "UseIPv4", "UseIPv6":
+		return true
+	}
+	return false
+}
+
+func normalizeQueryStrategy(s, fallback string) string {
+	trimmed := strings.TrimSpace(s)
+	if isValidQueryStrategy(trimmed) {
+		return trimmed
+	}
+	return fallback
+}
+
+// EffectiveDirectQueryStrategy returns the normalized direct DNS query strategy,
+// falling back to legacy QueryStrategy and then UseIPv4.
+func (d DNSConfig) EffectiveDirectQueryStrategy() string {
+	return normalizeQueryStrategy(d.DirectQueryStrategy, normalizeQueryStrategy(d.QueryStrategy, "UseIPv4"))
+}
+
+// EffectiveRemoteQueryStrategy returns the normalized remote DNS query strategy,
+// falling back to legacy QueryStrategy and then UseIPv4.
+func (d DNSConfig) EffectiveRemoteQueryStrategy() string {
+	return normalizeQueryStrategy(d.RemoteQueryStrategy, normalizeQueryStrategy(d.QueryStrategy, "UseIPv4"))
+}
+
+// IsDNSRedirect reports whether port 53 DNS hijacking (and DoT port 853 blocking) is enabled.
+func (d DNSConfig) IsDNSRedirect() bool {
+	if d.DNSRedirect == nil {
+		return true
+	}
+	return *d.DNSRedirect
+}
+
+func combinedTopLevelQueryStrategy(directQS, remoteQS string) string {
+	d := normalizeQueryStrategy(directQS, "UseIPv4")
+	r := normalizeQueryStrategy(remoteQS, "UseIPv4")
+	if d == r {
+		return d
+	}
+	// Xray intersects each server's queryStrategy with top-level dns.queryStrategy;
+	// UseIP keeps both IPv4 and IPv6 permitted so per-server strategies never conflict.
+	return "UseIP"
 }
 
 type GeoConfig struct {
-	BypassIran    *bool    `json:"bypass_iran,omitempty"`
-	BypassCN      *bool    `json:"bypass_cn,omitempty"`
-	BlockAds      *bool    `json:"block_ads,omitempty"`
-	DirectDomains []string `json:"direct_domains"`
-	DirectIPs     []string `json:"direct_ips"`
-	ProxyDomains  []string `json:"proxy_domains"`
-	ProxyIPs      []string `json:"proxy_ips"`
-	BlockDomains  []string `json:"block_domains"`
-	BlockIPs      []string `json:"block_ips"`
-	GeoIPURL      string   `json:"geoip_url"`
-	GeoSiteURL    string   `json:"geosite_url"`
-	LastGeoUpdate string   `json:"last_geo_update"`
+	BypassIran     *bool    `json:"bypass_iran,omitempty"`
+	BypassCN       *bool    `json:"bypass_cn,omitempty"`
+	BlockAds       *bool    `json:"block_ads,omitempty"`
+	DomainStrategy string   `json:"domain_strategy,omitempty"` // "AsIs", "IPIfNonMatch", "IPOnDemand"
+	DomainMatcher  string   `json:"domain_matcher,omitempty"`  // "hybrid", "linear"
+	DirectDomains  []string `json:"direct_domains"`
+	DirectIPs      []string `json:"direct_ips"`
+	ProxyDomains   []string `json:"proxy_domains"`
+	ProxyIPs       []string `json:"proxy_ips"`
+	BlockDomains   []string `json:"block_domains"`
+	BlockIPs       []string `json:"block_ips"`
+	GeoIPURL       string   `json:"geoip_url"`
+	GeoSiteURL     string   `json:"geosite_url"`
+	LastGeoUpdate  string   `json:"last_geo_update"`
+}
+
+func isValidDomainStrategy(s string) bool {
+	switch strings.TrimSpace(s) {
+	case "AsIs", "IPIfNonMatch", "IPOnDemand":
+		return true
+	}
+	return false
+}
+
+func normalizeDomainStrategy(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if isValidDomainStrategy(trimmed) {
+		return trimmed
+	}
+	return "IPIfNonMatch"
+}
+
+func isValidDomainMatcher(s string) bool {
+	switch strings.TrimSpace(s) {
+	case "hybrid", "linear":
+		return true
+	}
+	return false
+}
+
+func normalizeDomainMatcher(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if isValidDomainMatcher(trimmed) {
+		return trimmed
+	}
+	return "hybrid"
+}
+
+// EffectiveDomainStrategy returns the routing domainStrategy ("AsIs", "IPIfNonMatch", or "IPOnDemand").
+func (g GeoConfig) EffectiveDomainStrategy() string {
+	return normalizeDomainStrategy(g.DomainStrategy)
+}
+
+// EffectiveDomainMatcher returns the routing domainMatcher ("hybrid" or "linear").
+func (g GeoConfig) EffectiveDomainMatcher() string {
+	return normalizeDomainMatcher(g.DomainMatcher)
 }
 
 func (g GeoConfig) IsBypassIran() bool {
@@ -263,18 +357,72 @@ type GeoAssetsStatus struct {
 }
 
 type PanelState struct {
-	ProxyMode       string        `json:"proxy_mode"`        // "rule", "global", "direct"
-	ActiveNode      string        `json:"active_node"`
-	SubURL          string        `json:"sub_url"`
-	SubInsecure     bool          `json:"sub_insecure"`      // Ignore SSL/TLS cert errors
-	AutoUpdateHours int           `json:"auto_update_hours"` // 0 = disabled
-	LastSubUpdate   string        `json:"last_sub_update"`
-	AppFilterMode   string        `json:"app_filter_mode"` // "bypass" or "proxy"
-	SelectedUIDs    []int         `json:"selected_uids"`
-	LocalhostProxy  bool          `json:"localhost_proxy"`   // Proxy local device (default true)
-	DNS             DNSConfig     `json:"dns"`
-	Geo             GeoConfig     `json:"geo"`
-	Nodes           []NodeProfile `json:"nodes"`
+	ProxyMode          string        `json:"proxy_mode"`        // "rule", "global", "direct"
+	ActiveNode         string        `json:"active_node"`
+	SubURL             string        `json:"sub_url"`
+	SubInsecure        bool          `json:"sub_insecure"`      // Ignore SSL/TLS cert errors
+	AutoUpdateHours    int           `json:"auto_update_hours"` // 0 = disabled
+	LastSubUpdate      string        `json:"last_sub_update"`
+	AppFilterMode      string        `json:"app_filter_mode"` // "bypass" or "proxy"
+	SelectedUIDs       []int         `json:"selected_uids"`
+	LocalhostProxy     bool          `json:"localhost_proxy"`      // Proxy local device (default true)
+	AllowInsecureVless bool          `json:"allow_insecure_vless"` // Ignore Xray VLESS without TLS/encryption error via local bridge
+	DNS                DNSConfig     `json:"dns"`
+	Geo                GeoConfig     `json:"geo"`
+	Nodes              []NodeProfile `json:"nodes"`
+}
+
+type BackupBundle struct {
+	Format        string          `json:"format"`
+	Version       int             `json:"version"`
+	CreatedAt     string          `json:"created_at"`
+	ModuleVersion string          `json:"module_version,omitempty"`
+	State         *PanelState     `json:"state,omitempty"`
+	Config        json.RawMessage `json:"config,omitempty"`
+}
+
+type NodeEditRequest struct {
+	Action        string                 `json:"action"` // "import", "select", "delete", "edit", "update", "create", "add", "parse_uri", "export_uri"
+	URI           string                 `json:"uri"`
+	ID            string                 `json:"id"`
+	Name          string                 `json:"name"`
+	Protocol      string                 `json:"protocol"`
+	Address       string                 `json:"address"`
+	Port          int                    `json:"port"`
+	UUID          string                 `json:"uuid"`
+	Flow          string                 `json:"flow"`
+	Encryption    string                 `json:"encryption"`
+	AlterID       int                    `json:"alter_id"`
+	VmessSecurity string                 `json:"vmess_security"`
+	Password      string                 `json:"password"`
+	SSMethod      string                 `json:"ss_method"`
+	Network       string                 `json:"network"`
+	Host          string                 `json:"host"`
+	Path          string                 `json:"path"`
+	XhttpMode     string                 `json:"xhttp_mode"`
+	ServiceName   string                 `json:"service_name"`
+	GrpcMultiMode bool                   `json:"grpc_multi_mode"`
+	GrpcAuthority string                 `json:"grpc_authority"`
+	TcpHeaderType string                 `json:"tcp_header_type"`
+	KcpHeaderType string                 `json:"kcp_header_type"`
+	KcpSeed       string                 `json:"kcp_seed"`
+	Security      string                 `json:"security"`
+	SNI           string                 `json:"sni"`
+	Fingerprint   string                 `json:"fp"`
+	ALPN          string                 `json:"alpn"`
+	AllowInsecure *bool                  `json:"allow_insecure,omitempty"`
+	PinnedSha256  string                 `json:"pinned_sha256"`
+	RealityPBK    string                 `json:"pbk"`
+	RealitySID    string                 `json:"sid"`
+	RealitySPX    string                 `json:"spx"`
+	HyUp          string                 `json:"hy_up"`
+	HyDown        string                 `json:"hy_down"`
+	HyObfsType            string                 `json:"obfs_type"`
+	HyObfsPass            string                 `json:"obfs_password"`
+	SockoptDomainStrategy *string                `json:"sockopt_domain_strategy,omitempty"`
+	Activate              bool                   `json:"activate"`
+	FullEdit              bool                   `json:"full_edit"`
+	Outbound              map[string]interface{} `json:"outbound,omitempty"`
 }
 
 type TargetStatus struct {
@@ -316,14 +464,15 @@ func (w *CappedLogWriter) Write(p []byte) (int, error) {
 }
 
 var (
-	logSink      = &CappedLogWriter{path: LogFile}
-	stateMu      sync.Mutex
-	engineMu     sync.Mutex
-	engineActive bool
-	useTproxy    bool
-	xrayStopCh   chan struct{}
-	xrayDoneCh   chan struct{}
-	portHopRe    = regexp.MustCompile(`:(\d+)[-,][0-9,-]*([/?#].*|$)`)
+	logSink                = &CappedLogWriter{path: LogFile}
+	stateMu                sync.Mutex
+	engineMu               sync.Mutex
+	engineActive           bool
+	useTproxy              bool
+	xrayStopCh             chan struct{}
+	xrayDoneCh             chan struct{}
+	portHopRe              = regexp.MustCompile(`:(\d+)[-,][0-9,-]*([/?#].*|$)`)
+	dotlessPrivateDomainRe = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
 )
 
 func runCmd(name string, args ...string) error {
@@ -577,6 +726,1234 @@ func getProcessCPU(pid int) float64 {
 	return 0.0
 }
 
+func deepCloneValue(v interface{}) interface{} {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		return deepCloneMap(val)
+	case []interface{}:
+		out := make([]interface{}, len(val))
+		for i, item := range val {
+			out[i] = deepCloneValue(item)
+		}
+		return out
+	case []string:
+		out := make([]string, len(val))
+		copy(out, val)
+		return out
+	default:
+		return val
+	}
+}
+
+func deepCloneMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		out[k] = deepCloneValue(v)
+	}
+	return out
+}
+
+func jsonIntValue(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case string:
+		p, _ := strconv.Atoi(strings.TrimSpace(n))
+		return p
+	default:
+		return 0
+	}
+}
+
+// isPrivateOrLocalAddress mirrors Xray-core's requiresTransportSecurity check:
+// returns true if addr is a private/loopback/link-local IP or a recognized private/local domain.
+func isPrivateOrLocalAddress(addr string) bool {
+	clean := strings.TrimSpace(addr)
+	clean = strings.TrimPrefix(clean, "[")
+	clean = strings.TrimSuffix(clean, "]")
+	if clean == "" {
+		return false
+	}
+	if ip := net.ParseIP(clean); ip != nil {
+		return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast()
+	}
+	domain := strings.TrimSuffix(strings.ToLower(clean), ".")
+	if domain == "" {
+		return false
+	}
+	privateSuffixes := []string{
+		"lan", "localdomain", "example", "invalid",
+		"localhost", "test", "local", "home.arpa", "internal",
+	}
+	for _, s := range privateSuffixes {
+		if domain == s || strings.HasSuffix(domain, "."+s) {
+			return true
+		}
+	}
+	if !strings.Contains(domain, ".") && dotlessPrivateDomainRe.MatchString(domain) {
+		return true
+	}
+	return false
+}
+
+// vlessOutboundNeedsSecurityBypass reports whether an outbound triggers Xray-core's
+// "vless without TLS or other encryption is prohibited unless the server address is a private IP or domain" check.
+func vlessOutboundNeedsSecurityBypass(ob map[string]interface{}) (checkAddr string, dialAddr string, dialPort int, needs bool) {
+	if ob == nil {
+		return "", "", 0, false
+	}
+	proto, _ := ob["protocol"].(string)
+	if !strings.EqualFold(strings.TrimSpace(proto), "vless") {
+		return "", "", 0, false
+	}
+
+	ss, _ := ob["streamSettings"].(map[string]interface{})
+	if ss != nil {
+		sec, _ := ss["security"].(string)
+		secLower := strings.ToLower(strings.TrimSpace(sec))
+		if secLower != "" && secLower != "none" {
+			return "", "", 0, false
+		}
+	}
+
+	settings, _ := ob["settings"].(map[string]interface{})
+	if settings == nil {
+		return "", "", 0, false
+	}
+
+	var addr, enc string
+	var port int
+	if vnext, ok := settings["vnext"].([]interface{}); ok && len(vnext) > 0 {
+		if vObj, ok := vnext[0].(map[string]interface{}); ok {
+			addr, _ = vObj["address"].(string)
+			port = jsonIntValue(vObj["port"])
+			if users, ok := vObj["users"].([]interface{}); ok && len(users) > 0 {
+				if uObj, ok := users[0].(map[string]interface{}); ok {
+					enc, _ = uObj["encryption"].(string)
+				}
+			}
+		}
+	} else {
+		addr, _ = settings["address"].(string)
+		port = jsonIntValue(settings["port"])
+		enc, _ = settings["encryption"].(string)
+	}
+
+	addr = strings.TrimSpace(addr)
+	if addr == "" || port <= 0 {
+		return "", "", 0, false
+	}
+	encLower := strings.ToLower(strings.TrimSpace(enc))
+	if encLower != "" && encLower != "none" {
+		return "", "", 0, false
+	}
+	if isPrivateOrLocalAddress(addr) {
+		return "", "", 0, false
+	}
+
+	dialAddr = addr
+	dialPort = port
+	if ss != nil {
+		if ssAddr, _ := ss["address"].(string); strings.TrimSpace(ssAddr) != "" {
+			dialAddr = strings.TrimSpace(ssAddr)
+		}
+		if ssPort := jsonIntValue(ss["port"]); ssPort > 0 {
+			dialPort = ssPort
+		}
+	}
+	return addr, dialAddr, dialPort, true
+}
+
+func activeNodeNeedsVlessSecurityBypass(st PanelState) bool {
+	if st.ActiveNode == "" {
+		return false
+	}
+	for _, n := range st.Nodes {
+		if n.ID == st.ActiveNode {
+			_, _, _, needs := vlessOutboundNeedsSecurityBypass(n.Outbound)
+			return needs
+		}
+	}
+	return false
+}
+
+func preserveVlessTransportHost(ob map[string]interface{}, origHost string) {
+	if ob == nil || strings.TrimSpace(origHost) == "" {
+		return
+	}
+	ss, _ := ob["streamSettings"].(map[string]interface{})
+	if ss == nil {
+		return
+	}
+	netName, _ := ss["network"].(string)
+	switch strings.ToLower(strings.TrimSpace(netName)) {
+	case "ws", "websocket":
+		ws, _ := ss["wsSettings"].(map[string]interface{})
+		if ws == nil {
+			ws = map[string]interface{}{}
+			ss["wsSettings"] = ws
+		}
+		curHost, _ := ws["host"].(string)
+		headers, _ := ws["headers"].(map[string]interface{})
+		hdrHost := ""
+		if headers != nil {
+			hdrHost, _ = headers["Host"].(string)
+		}
+		if strings.TrimSpace(curHost) == "" && strings.TrimSpace(hdrHost) == "" {
+			ws["host"] = origHost
+		}
+	case "xhttp", "splithttp":
+		key := "xhttpSettings"
+		xh, _ := ss[key].(map[string]interface{})
+		if xh == nil {
+			if sh, ok := ss["splithttpSettings"].(map[string]interface{}); ok && sh != nil {
+				key = "splithttpSettings"
+				xh = sh
+			} else {
+				xh = map[string]interface{}{}
+				ss[key] = xh
+			}
+		}
+		if curHost, _ := xh["host"].(string); strings.TrimSpace(curHost) == "" {
+			xh["host"] = origHost
+		}
+	case "httpupgrade":
+		hu, _ := ss["httpupgradeSettings"].(map[string]interface{})
+		if hu == nil {
+			hu = map[string]interface{}{}
+			ss["httpupgradeSettings"] = hu
+		}
+		if curHost, _ := hu["host"].(string); strings.TrimSpace(curHost) == "" {
+			hu["host"] = origHost
+		}
+	case "grpc":
+		if net.ParseIP(origHost) == nil {
+			gs, _ := ss["grpcSettings"].(map[string]interface{})
+			if gs == nil {
+				gs = map[string]interface{}{}
+				ss["grpcSettings"] = gs
+			}
+			if auth, _ := gs["authority"].(string); strings.TrimSpace(auth) == "" {
+				gs["authority"] = origHost
+			}
+		}
+	}
+}
+
+func rewriteVlessOutboundTarget(ob map[string]interface{}, newAddr string, newPort int) {
+	if ob == nil {
+		return
+	}
+	if settings, ok := ob["settings"].(map[string]interface{}); ok && settings != nil {
+		if vnext, ok := settings["vnext"].([]interface{}); ok && len(vnext) > 0 {
+			if vObj, ok := vnext[0].(map[string]interface{}); ok {
+				vObj["address"] = newAddr
+				vObj["port"] = newPort
+			}
+		} else if _, hasAddr := settings["address"]; hasAddr {
+			settings["address"] = newAddr
+			settings["port"] = newPort
+		}
+	}
+	if ss, ok := ob["streamSettings"].(map[string]interface{}); ok && ss != nil {
+		delete(ss, "address")
+		delete(ss, "port")
+	}
+}
+
+func allocateFreeLoopbackPort(start int, used map[int]bool) int {
+	for p := start; p < 65000; p++ {
+		if used[p] {
+			continue
+		}
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err != nil {
+			continue
+		}
+		_ = ln.Close()
+		pc, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err != nil {
+			continue
+		}
+		_ = pc.Close()
+		return p
+	}
+	return start
+}
+
+func normalizeNodeProtocol(p string) string {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "hy2", "hysteria", "hysteria2":
+		return "hysteria2"
+	case "ss", "shadowsocks":
+		return "shadowsocks"
+	case "vless":
+		return "vless"
+	case "vmess":
+		return "vmess"
+	case "trojan":
+		return "trojan"
+	default:
+		return strings.ToLower(strings.TrimSpace(p))
+	}
+}
+
+func outboundProtocolForNode(p string) string {
+	norm := normalizeNodeProtocol(p)
+	if norm == "hysteria2" {
+		return "hysteria"
+	}
+	return norm
+}
+
+func syncNodeProfileFromOutbound(node *NodeProfile) {
+	if node == nil || node.Outbound == nil {
+		return
+	}
+	if proto, _ := node.Outbound["protocol"].(string); proto != "" {
+		node.Protocol = normalizeNodeProtocol(proto)
+	}
+	if settings, ok := node.Outbound["settings"].(map[string]interface{}); ok && settings != nil {
+		if vnext, ok := settings["vnext"].([]interface{}); ok && len(vnext) > 0 {
+			if vObj, ok := vnext[0].(map[string]interface{}); ok {
+				if addr, _ := vObj["address"].(string); addr != "" {
+					node.Address = addr
+				}
+				if port := jsonIntValue(vObj["port"]); port > 0 {
+					node.Port = port
+				}
+				return
+			}
+		}
+		if servers, ok := settings["servers"].([]interface{}); ok && len(servers) > 0 {
+			if sObj, ok := servers[0].(map[string]interface{}); ok {
+				if addr, _ := sObj["address"].(string); addr != "" {
+					node.Address = addr
+				}
+				if port := jsonIntValue(sObj["port"]); port > 0 {
+					node.Port = port
+				}
+				return
+			}
+		}
+		if addr, _ := settings["address"].(string); addr != "" {
+			node.Address = addr
+		}
+		if port := jsonIntValue(settings["port"]); port > 0 {
+			node.Port = port
+		}
+	}
+}
+
+func parseALPNList(raw string) []interface{} {
+	var out []interface{}
+	for _, part := range strings.Split(raw, ",") {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func applyNodeEditRequest(node *NodeProfile, req NodeEditRequest) error {
+	proto := normalizeNodeProtocol(req.Protocol)
+	if proto == "" {
+		proto = normalizeNodeProtocol(node.Protocol)
+	}
+	switch proto {
+	case "vless", "vmess", "trojan", "shadowsocks", "hysteria2":
+	default:
+		return fmt.Errorf("unsupported protocol %q", proto)
+	}
+
+	addr := strings.TrimSpace(req.Address)
+	if addr == "" {
+		addr = strings.TrimSpace(node.Address)
+	}
+	if addr == "" {
+		return fmt.Errorf("server address cannot be empty")
+	}
+
+	port := req.Port
+	if port <= 0 {
+		port = node.Port
+	}
+	if port <= 0 || port > 65535 {
+		if proto == "shadowsocks" && port == 0 {
+			port = 8388
+		} else if port == 0 {
+			port = 443
+		} else {
+			return fmt.Errorf("port must be between 1 and 65535")
+		}
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		if strings.TrimSpace(node.Name) != "" {
+			name = strings.TrimSpace(node.Name)
+		} else {
+			name = fmt.Sprintf("%s-%s:%d", proto, addr, port)
+		}
+	}
+
+	node.Name = name
+	node.Protocol = proto
+	node.Address = addr
+	node.Port = port
+
+	var ob map[string]interface{}
+	if node.Outbound != nil && strings.EqualFold(outboundProtocolForNode(proto), fmt.Sprintf("%v", node.Outbound["protocol"])) {
+		ob = deepCloneMap(node.Outbound)
+	} else {
+		ob = map[string]interface{}{}
+	}
+	ob["tag"] = "proxy"
+	ob["protocol"] = outboundProtocolForNode(proto)
+
+	settings, _ := ob["settings"].(map[string]interface{})
+	if settings == nil {
+		settings = map[string]interface{}{}
+	}
+
+	switch proto {
+	case "vless":
+		delete(settings, "servers")
+		delete(settings, "address")
+		delete(settings, "port")
+		delete(settings, "id")
+		delete(settings, "encryption")
+		delete(settings, "flow")
+		delete(settings, "version")
+
+		var vObj map[string]interface{}
+		if vnext, ok := settings["vnext"].([]interface{}); ok && len(vnext) > 0 {
+			vObj, _ = vnext[0].(map[string]interface{})
+		}
+		if vObj == nil {
+			vObj = map[string]interface{}{}
+		}
+		var uObj map[string]interface{}
+		if users, ok := vObj["users"].([]interface{}); ok && len(users) > 0 {
+			uObj, _ = users[0].(map[string]interface{})
+		}
+		if uObj == nil {
+			uObj = map[string]interface{}{}
+		}
+		uuidVal := strings.TrimSpace(req.UUID)
+		if uuidVal == "" {
+			uuidVal, _ = uObj["id"].(string)
+		}
+		if uuidVal == "" {
+			return fmt.Errorf("VLESS UUID is required")
+		}
+		uObj["id"] = uuidVal
+		enc := strings.TrimSpace(req.Encryption)
+		if enc == "" {
+			enc = "none"
+		}
+		uObj["encryption"] = enc
+		if flow := strings.TrimSpace(req.Flow); flow != "" {
+			uObj["flow"] = flow
+		} else {
+			delete(uObj, "flow")
+		}
+		vObj["address"] = addr
+		vObj["port"] = port
+		vObj["users"] = []interface{}{uObj}
+		settings["vnext"] = []interface{}{vObj}
+
+	case "vmess":
+		delete(settings, "servers")
+		delete(settings, "address")
+		delete(settings, "port")
+		delete(settings, "version")
+
+		var vObj map[string]interface{}
+		if vnext, ok := settings["vnext"].([]interface{}); ok && len(vnext) > 0 {
+			vObj, _ = vnext[0].(map[string]interface{})
+		}
+		if vObj == nil {
+			vObj = map[string]interface{}{}
+		}
+		var uObj map[string]interface{}
+		if users, ok := vObj["users"].([]interface{}); ok && len(users) > 0 {
+			uObj, _ = users[0].(map[string]interface{})
+		}
+		if uObj == nil {
+			uObj = map[string]interface{}{}
+		}
+		uuidVal := strings.TrimSpace(req.UUID)
+		if uuidVal == "" {
+			uuidVal, _ = uObj["id"].(string)
+		}
+		if uuidVal == "" {
+			return fmt.Errorf("VMess UUID is required")
+		}
+		uObj["id"] = uuidVal
+		aid := req.AlterID
+		if aid < 0 {
+			aid = 0
+		}
+		uObj["alterId"] = aid
+		vmSec := strings.TrimSpace(req.VmessSecurity)
+		if vmSec == "" {
+			vmSec = "auto"
+		}
+		uObj["security"] = vmSec
+		vObj["address"] = addr
+		vObj["port"] = port
+		vObj["users"] = []interface{}{uObj}
+		settings["vnext"] = []interface{}{vObj}
+
+	case "trojan":
+		delete(settings, "vnext")
+		delete(settings, "address")
+		delete(settings, "port")
+		delete(settings, "version")
+
+		var sObj map[string]interface{}
+		if servers, ok := settings["servers"].([]interface{}); ok && len(servers) > 0 {
+			sObj, _ = servers[0].(map[string]interface{})
+		}
+		if sObj == nil {
+			sObj = map[string]interface{}{}
+		}
+		pw := req.Password
+		if pw == "" {
+			pw, _ = sObj["password"].(string)
+		}
+		if pw == "" {
+			return fmt.Errorf("Trojan password is required")
+		}
+		delete(sObj, "method")
+		sObj["address"] = addr
+		sObj["port"] = port
+		sObj["password"] = pw
+		settings["servers"] = []interface{}{sObj}
+
+	case "shadowsocks":
+		delete(settings, "vnext")
+		delete(settings, "address")
+		delete(settings, "port")
+		delete(settings, "version")
+
+		var sObj map[string]interface{}
+		if servers, ok := settings["servers"].([]interface{}); ok && len(servers) > 0 {
+			sObj, _ = servers[0].(map[string]interface{})
+		}
+		if sObj == nil {
+			sObj = map[string]interface{}{}
+		}
+		method := strings.TrimSpace(req.SSMethod)
+		if method == "" {
+			method, _ = sObj["method"].(string)
+		}
+		if method == "" {
+			method = "aes-256-gcm"
+		}
+		pw := req.Password
+		if pw == "" && req.SSMethod == "" {
+			pw, _ = sObj["password"].(string)
+		}
+		sObj["address"] = addr
+		sObj["port"] = port
+		sObj["method"] = method
+		sObj["password"] = pw
+		settings["servers"] = []interface{}{sObj}
+
+	case "hysteria2":
+		delete(settings, "vnext")
+		delete(settings, "servers")
+		settings["version"] = 2
+		settings["address"] = addr
+		settings["port"] = port
+	}
+	ob["settings"] = settings
+
+	ss, _ := ob["streamSettings"].(map[string]interface{})
+	if ss == nil {
+		ss = map[string]interface{}{}
+	}
+
+	if proto == "hysteria2" {
+		for _, k := range []string{"wsSettings", "xhttpSettings", "splithttpSettings", "httpupgradeSettings", "grpcSettings", "kcpSettings", "tcpSettings", "realitySettings"} {
+			delete(ss, k)
+		}
+		ss["network"] = "hysteria"
+		ss["security"] = "tls"
+
+		hySet, _ := ss["hysteriaSettings"].(map[string]interface{})
+		if hySet == nil {
+			hySet = map[string]interface{}{}
+		}
+		hySet["version"] = 2
+		hySet["auth"] = req.Password
+		if jsonIntValue(hySet["udpIdleTimeout"]) <= 0 {
+			hySet["udpIdleTimeout"] = 60
+		}
+		if up := strings.TrimSpace(req.HyUp); up != "" {
+			if !strings.Contains(up, " ") {
+				up += " mbps"
+			}
+			hySet["up"] = up
+		} else {
+			delete(hySet, "up")
+		}
+		if down := strings.TrimSpace(req.HyDown); down != "" {
+			if !strings.Contains(down, " ") {
+				down += " mbps"
+			}
+			hySet["down"] = down
+		} else {
+			delete(hySet, "down")
+		}
+		ss["hysteriaSettings"] = hySet
+
+		obfsType := strings.TrimSpace(req.HyObfsType)
+		obfsPass := req.HyObfsPass
+		if obfsType != "" && obfsPass != "" {
+			maskObj := []interface{}{
+				map[string]interface{}{
+					"type": obfsType,
+					"settings": map[string]interface{}{
+						"password": obfsPass,
+					},
+				},
+			}
+			ss["finalmask"] = map[string]interface{}{"udp": maskObj}
+			ss["udpmasks"] = maskObj
+		} else {
+			delete(ss, "finalmask")
+			delete(ss, "udpmasks")
+		}
+
+		tlsSet, _ := ss["tlsSettings"].(map[string]interface{})
+		if tlsSet == nil {
+			tlsSet = map[string]interface{}{}
+		}
+		sni := strings.TrimSpace(req.SNI)
+		if sni == "" {
+			sni = addr
+		}
+		tlsSet["serverName"] = sni
+		fp := strings.TrimSpace(req.Fingerprint)
+		if fp == "" {
+			fp = "chrome"
+		}
+		tlsSet["fingerprint"] = fp
+		alpnList := parseALPNList(req.ALPN)
+		if len(alpnList) == 0 {
+			alpnList = []interface{}{"h3"}
+		}
+		tlsSet["alpn"] = alpnList
+		if req.AllowInsecure != nil {
+			tlsSet["allowInsecure"] = *req.AllowInsecure
+		} else {
+			tlsSet["allowInsecure"] = false
+		}
+		if pin := strings.TrimSpace(req.PinnedSha256); pin != "" {
+			tlsSet["pinnedPeerCertificateSha256"] = pin
+		} else {
+			delete(tlsSet, "pinnedPeerCertificateSha256")
+		}
+		ss["tlsSettings"] = tlsSet
+		ob["streamSettings"] = ss
+	} else {
+		delete(ss, "hysteriaSettings")
+		delete(ss, "finalmask")
+		delete(ss, "udpmasks")
+
+		netType := strings.ToLower(strings.TrimSpace(req.Network))
+		if netType == "splithttp" {
+			netType = "xhttp"
+		}
+		sec := strings.ToLower(strings.TrimSpace(req.Security))
+
+		if proto == "shadowsocks" && (netType == "" || netType == "tcp") && (sec == "" || sec == "none") && strings.TrimSpace(req.TcpHeaderType) != "http" {
+			delete(ob, "streamSettings")
+		} else {
+			if netType == "" {
+				netType = "tcp"
+			}
+			ss["network"] = netType
+
+			for _, k := range []string{"wsSettings", "xhttpSettings", "splithttpSettings", "httpupgradeSettings", "grpcSettings", "kcpSettings", "tcpSettings"} {
+				if (netType == "ws" && k == "wsSettings") ||
+					(netType == "xhttp" && k == "xhttpSettings") ||
+					(netType == "httpupgrade" && k == "httpupgradeSettings") ||
+					(netType == "grpc" && k == "grpcSettings") ||
+					(netType == "kcp" && k == "kcpSettings") ||
+					((netType == "tcp" || netType == "raw") && k == "tcpSettings") {
+					continue
+				}
+				delete(ss, k)
+			}
+
+			path := strings.TrimSpace(req.Path)
+			host := strings.TrimSpace(req.Host)
+
+			switch netType {
+			case "tcp", "raw":
+				if strings.ToLower(strings.TrimSpace(req.TcpHeaderType)) == "http" {
+					if path == "" {
+						path = "/"
+					}
+					reqHdr := map[string]interface{}{
+						"version": "1.1",
+						"method":  "GET",
+						"path":    []interface{}{path},
+					}
+					if host != "" {
+						reqHdr["headers"] = map[string]interface{}{
+							"Host": []interface{}{host},
+						}
+					}
+					ss["tcpSettings"] = map[string]interface{}{
+						"header": map[string]interface{}{
+							"type":    "http",
+							"request": reqHdr,
+						},
+					}
+				} else {
+					delete(ss, "tcpSettings")
+				}
+			case "ws":
+				if path == "" {
+					path = "/"
+				}
+				ws := map[string]interface{}{"path": path}
+				if host != "" {
+					ws["host"] = host
+					ws["headers"] = map[string]interface{}{"Host": host}
+				}
+				ss["wsSettings"] = ws
+			case "xhttp":
+				if path == "" {
+					path = "/"
+				}
+				xh, _ := ss["xhttpSettings"].(map[string]interface{})
+				if xh == nil {
+					xh = map[string]interface{}{}
+				}
+				xh["path"] = path
+				if host != "" {
+					xh["host"] = host
+				} else {
+					delete(xh, "host")
+				}
+				if mode := strings.TrimSpace(req.XhttpMode); mode != "" {
+					xh["mode"] = mode
+				} else {
+					delete(xh, "mode")
+				}
+				ss["xhttpSettings"] = xh
+			case "httpupgrade":
+				if path == "" {
+					path = "/"
+				}
+				hu := map[string]interface{}{"path": path}
+				if host != "" {
+					hu["host"] = host
+				}
+				ss["httpupgradeSettings"] = hu
+			case "grpc":
+				gs := map[string]interface{}{
+					"serviceName": strings.TrimSpace(req.ServiceName),
+				}
+				if req.GrpcMultiMode {
+					gs["multiMode"] = true
+				}
+				if auth := strings.TrimSpace(req.GrpcAuthority); auth != "" {
+					gs["authority"] = auth
+				}
+				ss["grpcSettings"] = gs
+			case "kcp":
+				ks := map[string]interface{}{}
+				hdrType := strings.TrimSpace(req.KcpHeaderType)
+				if hdrType != "" && hdrType != "none" {
+					ks["header"] = map[string]interface{}{"type": hdrType}
+				}
+				if seed := strings.TrimSpace(req.KcpSeed); seed != "" {
+					ks["seed"] = seed
+				}
+				ss["kcpSettings"] = ks
+			}
+
+			switch sec {
+			case "tls":
+				ss["security"] = "tls"
+				delete(ss, "realitySettings")
+				tlsSet, _ := ss["tlsSettings"].(map[string]interface{})
+				if tlsSet == nil {
+					tlsSet = map[string]interface{}{}
+				}
+				if sni := strings.TrimSpace(req.SNI); sni != "" {
+					tlsSet["serverName"] = sni
+				} else {
+					delete(tlsSet, "serverName")
+				}
+				if fp := strings.TrimSpace(req.Fingerprint); fp != "" {
+					tlsSet["fingerprint"] = fp
+				} else {
+					delete(tlsSet, "fingerprint")
+				}
+				if alpn := parseALPNList(req.ALPN); len(alpn) > 0 {
+					tlsSet["alpn"] = alpn
+				} else {
+					delete(tlsSet, "alpn")
+				}
+				if req.AllowInsecure != nil && *req.AllowInsecure {
+					tlsSet["allowInsecure"] = true
+				} else {
+					delete(tlsSet, "allowInsecure")
+				}
+				if pin := strings.TrimSpace(req.PinnedSha256); pin != "" {
+					tlsSet["pinnedPeerCertificateSha256"] = pin
+				} else {
+					delete(tlsSet, "pinnedPeerCertificateSha256")
+				}
+				ss["tlsSettings"] = tlsSet
+			case "reality":
+				ss["security"] = "reality"
+				delete(ss, "tlsSettings")
+				fp := strings.TrimSpace(req.Fingerprint)
+				if fp == "" {
+					fp = "chrome"
+				}
+				ss["realitySettings"] = map[string]interface{}{
+					"serverName":  strings.TrimSpace(req.SNI),
+					"fingerprint": fp,
+					"publicKey":   strings.TrimSpace(req.RealityPBK),
+					"shortId":     strings.TrimSpace(req.RealitySID),
+					"spiderX":     strings.TrimSpace(req.RealitySPX),
+				}
+			default:
+				delete(ss, "security")
+				delete(ss, "tlsSettings")
+				delete(ss, "realitySettings")
+			}
+
+			ob["streamSettings"] = ss
+		}
+	}
+
+	if req.SockoptDomainStrategy != nil {
+		ds := strings.TrimSpace(*req.SockoptDomainStrategy)
+		if ds != "" {
+			switch ds {
+			case "AsIs", "UseIP", "UseIPv4", "UseIPv6", "UseIPv4v6", "UseIPv6v4", "ForceIP", "ForceIPv4", "ForceIPv6", "ForceIPv4v6", "ForceIPv6v4":
+			default:
+				return fmt.Errorf("unsupported sockopt domainStrategy %q", ds)
+			}
+			curSS, _ := ob["streamSettings"].(map[string]interface{})
+			if curSS == nil {
+				curSS = map[string]interface{}{}
+			}
+			sockopt, _ := curSS["sockopt"].(map[string]interface{})
+			if sockopt == nil {
+				sockopt = map[string]interface{}{}
+			}
+			sockopt["domainStrategy"] = ds
+			curSS["sockopt"] = sockopt
+			ob["streamSettings"] = curSS
+		} else if curSS, ok := ob["streamSettings"].(map[string]interface{}); ok {
+			if sockopt, ok := curSS["sockopt"].(map[string]interface{}); ok {
+				delete(sockopt, "domainStrategy")
+				if len(sockopt) == 0 {
+					delete(curSS, "sockopt")
+				}
+			}
+			if len(curSS) == 0 {
+				delete(ob, "streamSettings")
+			}
+		}
+	}
+
+	node.Outbound = ob
+	return nil
+}
+
+func buildShareURI(node NodeProfile) string {
+	proto := normalizeNodeProtocol(node.Protocol)
+	ob := node.Outbound
+	if ob == nil {
+		return ""
+	}
+	settings, _ := ob["settings"].(map[string]interface{})
+	ss, _ := ob["streamSettings"].(map[string]interface{})
+
+	getFirstVnext := func() (string, int, map[string]interface{}) {
+		if settings == nil {
+			return node.Address, node.Port, nil
+		}
+		if vnext, ok := settings["vnext"].([]interface{}); ok && len(vnext) > 0 {
+			if vObj, ok := vnext[0].(map[string]interface{}); ok {
+				a, _ := vObj["address"].(string)
+				p := jsonIntValue(vObj["port"])
+				var uObj map[string]interface{}
+				if users, ok := vObj["users"].([]interface{}); ok && len(users) > 0 {
+					uObj, _ = users[0].(map[string]interface{})
+				}
+				return a, p, uObj
+			}
+		}
+		return node.Address, node.Port, nil
+	}
+	getFirstServer := func() (string, int, map[string]interface{}) {
+		if settings == nil {
+			return node.Address, node.Port, nil
+		}
+		if servers, ok := settings["servers"].([]interface{}); ok && len(servers) > 0 {
+			if sObj, ok := servers[0].(map[string]interface{}); ok {
+				a, _ := sObj["address"].(string)
+				p := jsonIntValue(sObj["port"])
+				return a, p, sObj
+			}
+		}
+		return node.Address, node.Port, nil
+	}
+
+	switch proto {
+	case "shadowsocks":
+		addr, port, srv := getFirstServer()
+		method, _ := srv["method"].(string)
+		pw, _ := srv["password"].(string)
+		if addr == "" || port <= 0 {
+			return ""
+		}
+		creds := base64.RawURLEncoding.EncodeToString([]byte(method + ":" + pw))
+		u := url.URL{
+			Scheme:   "ss",
+			User:     url.User(creds),
+			Host:     net.JoinHostPort(addr, strconv.Itoa(port)),
+			Fragment: node.Name,
+		}
+		return u.String()
+
+	case "vmess":
+		addr, port, uObj := getFirstVnext()
+		if addr == "" || port <= 0 {
+			return ""
+		}
+		uuidVal, _ := uObj["id"].(string)
+		vmSec, _ := uObj["security"].(string)
+		aid := jsonIntValue(uObj["alterId"])
+		payload := map[string]interface{}{
+			"v":    "2",
+			"ps":   node.Name,
+			"add":  addr,
+			"port": port,
+			"id":   uuidVal,
+			"aid":  aid,
+			"scy":  vmSec,
+			"net":  "tcp",
+			"type": "none",
+		}
+		if ss != nil {
+			if netType, _ := ss["network"].(string); netType != "" {
+				payload["net"] = netType
+			}
+			if sec, _ := ss["security"].(string); sec == "tls" {
+				payload["tls"] = "tls"
+				if tlsSet, _ := ss["tlsSettings"].(map[string]interface{}); tlsSet != nil {
+					if sni, _ := tlsSet["serverName"].(string); sni != "" {
+						payload["sni"] = sni
+					}
+					if fp, _ := tlsSet["fingerprint"].(string); fp != "" {
+						payload["fp"] = fp
+					}
+					if alpnArr, ok := tlsSet["alpn"].([]interface{}); ok && len(alpnArr) > 0 {
+						var parts []string
+						for _, a := range alpnArr {
+							parts = append(parts, fmt.Sprintf("%v", a))
+						}
+						payload["alpn"] = strings.Join(parts, ",")
+					}
+					if allow, ok := tlsSet["allowInsecure"].(bool); ok && allow {
+						payload["allowInsecure"] = true
+					}
+				}
+			}
+			switch payload["net"] {
+			case "ws":
+				if ws, _ := ss["wsSettings"].(map[string]interface{}); ws != nil {
+					payload["path"], _ = ws["path"].(string)
+					if h, _ := ws["host"].(string); h != "" {
+						payload["host"] = h
+					} else if hdrs, _ := ws["headers"].(map[string]interface{}); hdrs != nil {
+						payload["host"], _ = hdrs["Host"].(string)
+					}
+				}
+			case "xhttp", "splithttp":
+				if xh, _ := ss["xhttpSettings"].(map[string]interface{}); xh != nil {
+					payload["path"], _ = xh["path"].(string)
+					payload["host"], _ = xh["host"].(string)
+				}
+			case "httpupgrade":
+				if hu, _ := ss["httpupgradeSettings"].(map[string]interface{}); hu != nil {
+					payload["path"], _ = hu["path"].(string)
+					payload["host"], _ = hu["host"].(string)
+				}
+			case "grpc":
+				if gs, _ := ss["grpcSettings"].(map[string]interface{}); gs != nil {
+					payload["path"], _ = gs["serviceName"].(string)
+					if mm, _ := gs["multiMode"].(bool); mm {
+						payload["type"] = "multi"
+					}
+				}
+			}
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return ""
+		}
+		return "vmess://" + base64.StdEncoding.EncodeToString(raw)
+
+	case "hysteria2":
+		addr, _ := settings["address"].(string)
+		port := jsonIntValue(settings["port"])
+		if addr == "" {
+			addr = node.Address
+		}
+		if port <= 0 {
+			port = node.Port
+		}
+		if addr == "" || port <= 0 {
+			return ""
+		}
+		q := url.Values{}
+		var auth string
+		if ss != nil {
+			if hySet, _ := ss["hysteriaSettings"].(map[string]interface{}); hySet != nil {
+				auth, _ = hySet["auth"].(string)
+				if up, _ := hySet["up"].(string); up != "" {
+					q.Set("up", strings.TrimSuffix(up, " mbps"))
+				}
+				if down, _ := hySet["down"].(string); down != "" {
+					q.Set("down", strings.TrimSuffix(down, " mbps"))
+				}
+			}
+			if tlsSet, _ := ss["tlsSettings"].(map[string]interface{}); tlsSet != nil {
+				if sni, _ := tlsSet["serverName"].(string); sni != "" {
+					q.Set("sni", sni)
+				}
+				if fp, _ := tlsSet["fingerprint"].(string); fp != "" {
+					q.Set("fp", fp)
+				}
+				if allow, _ := tlsSet["allowInsecure"].(bool); allow {
+					q.Set("insecure", "1")
+				}
+				if pin, _ := tlsSet["pinnedPeerCertificateSha256"].(string); pin != "" {
+					q.Set("pinSHA256", pin)
+				}
+				if alpnArr, ok := tlsSet["alpn"].([]interface{}); ok && len(alpnArr) > 0 {
+					var parts []string
+					for _, a := range alpnArr {
+						parts = append(parts, fmt.Sprintf("%v", a))
+					}
+					q.Set("alpn", strings.Join(parts, ","))
+				}
+			}
+			if fm, _ := ss["finalmask"].(map[string]interface{}); fm != nil {
+				if udpArr, ok := fm["udp"].([]interface{}); ok && len(udpArr) > 0 {
+					if mObj, ok := udpArr[0].(map[string]interface{}); ok {
+						if t, _ := mObj["type"].(string); t != "" {
+							q.Set("obfs", t)
+						}
+						if mSet, _ := mObj["settings"].(map[string]interface{}); mSet != nil {
+							if op, _ := mSet["password"].(string); op != "" {
+								q.Set("obfs-password", op)
+							}
+						}
+					}
+				}
+			}
+		}
+		u := url.URL{
+			Scheme:   "hysteria2",
+			User:     url.User(auth),
+			Host:     net.JoinHostPort(addr, strconv.Itoa(port)),
+			RawQuery: q.Encode(),
+			Fragment: node.Name,
+		}
+		return u.String()
+
+	case "vless", "trojan":
+		var addr, userCred string
+		var port int
+		q := url.Values{}
+		if proto == "vless" {
+			var uObj map[string]interface{}
+			addr, port, uObj = getFirstVnext()
+			userCred, _ = uObj["id"].(string)
+			enc, _ := uObj["encryption"].(string)
+			if enc == "" {
+				enc = "none"
+			}
+			q.Set("encryption", enc)
+			if flow, _ := uObj["flow"].(string); flow != "" {
+				q.Set("flow", flow)
+			}
+		} else {
+			var sObj map[string]interface{}
+			addr, port, sObj = getFirstServer()
+			userCred, _ = sObj["password"].(string)
+		}
+		if addr == "" || port <= 0 {
+			return ""
+		}
+
+		netType := "tcp"
+		if ss != nil {
+			if nt, _ := ss["network"].(string); nt != "" {
+				netType = nt
+			}
+			q.Set("type", netType)
+
+			sec, _ := ss["security"].(string)
+			if sec == "" {
+				sec = "none"
+			}
+			q.Set("security", sec)
+
+			if sec == "tls" {
+				if tlsSet, _ := ss["tlsSettings"].(map[string]interface{}); tlsSet != nil {
+					if sni, _ := tlsSet["serverName"].(string); sni != "" {
+						q.Set("sni", sni)
+					}
+					if fp, _ := tlsSet["fingerprint"].(string); fp != "" {
+						q.Set("fp", fp)
+					}
+					if allow, _ := tlsSet["allowInsecure"].(bool); allow {
+						q.Set("allowInsecure", "1")
+					}
+					if alpnArr, ok := tlsSet["alpn"].([]interface{}); ok && len(alpnArr) > 0 {
+						var parts []string
+						for _, a := range alpnArr {
+							parts = append(parts, fmt.Sprintf("%v", a))
+						}
+						q.Set("alpn", strings.Join(parts, ","))
+					}
+				}
+			} else if sec == "reality" {
+				if rs, _ := ss["realitySettings"].(map[string]interface{}); rs != nil {
+					if sni, _ := rs["serverName"].(string); sni != "" {
+						q.Set("sni", sni)
+					}
+					if fp, _ := rs["fingerprint"].(string); fp != "" {
+						q.Set("fp", fp)
+					}
+					if pbk, _ := rs["publicKey"].(string); pbk != "" {
+						q.Set("pbk", pbk)
+					}
+					if sid, _ := rs["shortId"].(string); sid != "" {
+						q.Set("sid", sid)
+					}
+					if spx, _ := rs["spiderX"].(string); spx != "" {
+						q.Set("spx", spx)
+					}
+				}
+			}
+
+			switch netType {
+			case "ws":
+				if ws, _ := ss["wsSettings"].(map[string]interface{}); ws != nil {
+					if p, _ := ws["path"].(string); p != "" {
+						q.Set("path", p)
+					}
+					if h, _ := ws["host"].(string); h != "" {
+						q.Set("host", h)
+					} else if hdrs, _ := ws["headers"].(map[string]interface{}); hdrs != nil {
+						if h, _ := hdrs["Host"].(string); h != "" {
+							q.Set("host", h)
+						}
+					}
+				}
+			case "xhttp", "splithttp":
+				if xh, _ := ss["xhttpSettings"].(map[string]interface{}); xh != nil {
+					if p, _ := xh["path"].(string); p != "" {
+						q.Set("path", p)
+					}
+					if h, _ := xh["host"].(string); h != "" {
+						q.Set("host", h)
+					}
+					if m, _ := xh["mode"].(string); m != "" {
+						q.Set("mode", m)
+					}
+				}
+			case "httpupgrade":
+				if hu, _ := ss["httpupgradeSettings"].(map[string]interface{}); hu != nil {
+					if p, _ := hu["path"].(string); p != "" {
+						q.Set("path", p)
+					}
+					if h, _ := hu["host"].(string); h != "" {
+						q.Set("host", h)
+					}
+				}
+			case "grpc":
+				if gs, _ := ss["grpcSettings"].(map[string]interface{}); gs != nil {
+					if sn, _ := gs["serviceName"].(string); sn != "" {
+						q.Set("serviceName", sn)
+					}
+					if mm, _ := gs["multiMode"].(bool); mm {
+						q.Set("mode", "multi")
+					}
+					if auth, _ := gs["authority"].(string); auth != "" {
+						q.Set("authority", auth)
+					}
+				}
+			case "tcp", "raw":
+				if ts, _ := ss["tcpSettings"].(map[string]interface{}); ts != nil {
+					if hdr, _ := ts["header"].(map[string]interface{}); hdr != nil {
+						if ht, _ := hdr["type"].(string); ht == "http" {
+							q.Set("headerType", "http")
+							if rObj, _ := hdr["request"].(map[string]interface{}); rObj != nil {
+								if pArr, ok := rObj["path"].([]interface{}); ok && len(pArr) > 0 {
+									q.Set("path", fmt.Sprintf("%v", pArr[0]))
+								}
+								if hMap, _ := rObj["headers"].(map[string]interface{}); hMap != nil {
+									if hArr, ok := hMap["Host"].([]interface{}); ok && len(hArr) > 0 {
+										q.Set("host", fmt.Sprintf("%v", hArr[0]))
+									}
+								}
+							}
+						}
+					}
+				}
+			case "kcp":
+				if ks, _ := ss["kcpSettings"].(map[string]interface{}); ks != nil {
+					if hdr, _ := ks["header"].(map[string]interface{}); hdr != nil {
+						if ht, _ := hdr["type"].(string); ht != "" {
+							q.Set("headerType", ht)
+						}
+					}
+					if seed, _ := ks["seed"].(string); seed != "" {
+						q.Set("seed", seed)
+					}
+				}
+			}
+		}
+		u := url.URL{
+			Scheme:   proto,
+			User:     url.User(userCred),
+			Host:     net.JoinHostPort(addr, strconv.Itoa(port)),
+			RawQuery: q.Encode(),
+			Fragment: node.Name,
+		}
+		return u.String()
+	}
+	return ""
+}
+
 func updateNodeOutboundAddressAndPort(node *NodeProfile, newAddr string, newPort int, newSNI string) {
 	if node.Outbound == nil {
 		node.Outbound = make(map[string]interface{})
@@ -592,8 +1969,7 @@ func updateNodeOutboundAddressAndPort(node *NodeProfile, newAddr string, newPort
 					vObj["port"] = newPort
 				}
 			}
-		}
-		if servers, ok := settings["servers"].([]interface{}); ok && len(servers) > 0 {
+		} else if servers, ok := settings["servers"].([]interface{}); ok && len(servers) > 0 {
 			if sObj, ok := servers[0].(map[string]interface{}); ok {
 				if newAddr != "" {
 					sObj["address"] = newAddr
@@ -601,6 +1977,13 @@ func updateNodeOutboundAddressAndPort(node *NodeProfile, newAddr string, newPort
 				if newPort > 0 {
 					sObj["port"] = newPort
 				}
+			}
+		} else {
+			if newAddr != "" {
+				settings["address"] = newAddr
+			}
+			if newPort > 0 {
+				settings["port"] = newPort
 			}
 		}
 	}
@@ -796,6 +2179,83 @@ func invalidateStateCache() {
 	stateMu.Unlock()
 }
 
+func sanitizePanelState(st *PanelState) {
+	if st.ProxyMode != "rule" && st.ProxyMode != "global" && st.ProxyMode != "direct" {
+		st.ProxyMode = "rule"
+	}
+	if st.AppFilterMode != "bypass" && st.AppFilterMode != "proxy" {
+		st.AppFilterMode = "bypass"
+	}
+	if st.SelectedUIDs == nil {
+		st.SelectedUIDs = []int{}
+	}
+	if st.Nodes == nil {
+		st.Nodes = []NodeProfile{}
+	}
+	for i := range st.Nodes {
+		if strings.TrimSpace(st.Nodes[i].ID) == "" {
+			st.Nodes[i].ID = fmt.Sprintf("restored-%d-%d", time.Now().UnixNano(), i)
+		}
+		if st.Nodes[i].Outbound != nil {
+			syncNodeProfileFromOutbound(&st.Nodes[i])
+		}
+	}
+
+	if st.DNS.RemoteDNS == "" {
+		st.DNS.RemoteDNS = "tcp://1.1.1.1"
+	}
+	if st.DNS.DirectDNS == "" {
+		st.DNS.DirectDNS = "1.1.1.1"
+	}
+	baseQS := normalizeQueryStrategy(st.DNS.QueryStrategy, "UseIPv4")
+	st.DNS.DirectQueryStrategy = normalizeQueryStrategy(st.DNS.DirectQueryStrategy, baseQS)
+	st.DNS.RemoteQueryStrategy = normalizeQueryStrategy(st.DNS.RemoteQueryStrategy, baseQS)
+	st.DNS.QueryStrategy = combinedTopLevelQueryStrategy(st.DNS.DirectQueryStrategy, st.DNS.RemoteQueryStrategy)
+
+	boolTrue := true
+	if st.DNS.DNSRedirect == nil {
+		boolTrueDNS := true
+		st.DNS.DNSRedirect = &boolTrueDNS
+	}
+	if st.Geo.BypassIran == nil {
+		st.Geo.BypassIran = &boolTrue
+	}
+	if st.Geo.BypassCN == nil {
+		boolTrueCN := true
+		st.Geo.BypassCN = &boolTrueCN
+	}
+	if st.Geo.BlockAds == nil {
+		boolTrueAds := true
+		st.Geo.BlockAds = &boolTrueAds
+	}
+	st.Geo.DomainStrategy = normalizeDomainStrategy(st.Geo.DomainStrategy)
+	st.Geo.DomainMatcher = normalizeDomainMatcher(st.Geo.DomainMatcher)
+	if st.Geo.DirectDomains == nil {
+		st.Geo.DirectDomains = []string{}
+	}
+	if st.Geo.DirectIPs == nil {
+		st.Geo.DirectIPs = []string{}
+	}
+	if st.Geo.ProxyDomains == nil {
+		st.Geo.ProxyDomains = []string{}
+	}
+	if st.Geo.ProxyIPs == nil {
+		st.Geo.ProxyIPs = []string{}
+	}
+	if st.Geo.BlockDomains == nil {
+		st.Geo.BlockDomains = []string{}
+	}
+	if st.Geo.BlockIPs == nil {
+		st.Geo.BlockIPs = []string{}
+	}
+	if st.Geo.GeoIPURL == "" {
+		st.Geo.GeoIPURL = "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geoip.dat"
+	}
+	if st.Geo.GeoSiteURL == "" {
+		st.Geo.GeoSiteURL = "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geosite.dat"
+	}
+}
+
 func loadState() PanelState {
 	stateMu.Lock()
 	defer stateMu.Unlock()
@@ -856,18 +2316,7 @@ func loadState() PanelState {
 		}
 	}
 
-	if st.ProxyMode != "rule" && st.ProxyMode != "global" && st.ProxyMode != "direct" {
-		st.ProxyMode = "rule"
-	}
-	if st.AppFilterMode != "bypass" && st.AppFilterMode != "proxy" {
-		st.AppFilterMode = "bypass"
-	}
-	if st.SelectedUIDs == nil {
-		st.SelectedUIDs = []int{}
-	}
-	if st.Nodes == nil {
-		st.Nodes = []NodeProfile{}
-	}
+	sanitizePanelState(&st)
 
 	// Validate ActiveNode: ensure active node exists in nodes list, or fallback to first node
 	activeExists := false
@@ -885,51 +2334,8 @@ func loadState() PanelState {
 			_ = writeSyncedFile(StateFile, data)
 			_ = writeSyncedFile(PersistStateFile, data)
 		}
-	}
-
-	if st.DNS.RemoteDNS == "" {
-		st.DNS.RemoteDNS = "tcp://1.1.1.1"
-	}
-	if st.DNS.DirectDNS == "" {
-		st.DNS.DirectDNS = "1.1.1.1"
-	}
-	if st.DNS.QueryStrategy == "" {
-		st.DNS.QueryStrategy = "UseIPv4"
-	}
-
-	boolTrue := true
-	if st.Geo.BypassIran == nil {
-		st.Geo.BypassIran = &boolTrue
-	}
-	if st.Geo.BypassCN == nil {
-		st.Geo.BypassCN = &boolTrue
-	}
-	if st.Geo.BlockAds == nil {
-		st.Geo.BlockAds = &boolTrue
-	}
-	if st.Geo.DirectDomains == nil {
-		st.Geo.DirectDomains = []string{}
-	}
-	if st.Geo.DirectIPs == nil {
-		st.Geo.DirectIPs = []string{}
-	}
-	if st.Geo.ProxyDomains == nil {
-		st.Geo.ProxyDomains = []string{}
-	}
-	if st.Geo.ProxyIPs == nil {
-		st.Geo.ProxyIPs = []string{}
-	}
-	if st.Geo.BlockDomains == nil {
-		st.Geo.BlockDomains = []string{}
-	}
-	if st.Geo.BlockIPs == nil {
-		st.Geo.BlockIPs = []string{}
-	}
-	if st.Geo.GeoIPURL == "" {
-		st.Geo.GeoIPURL = "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geoip.dat"
-	}
-	if st.Geo.GeoSiteURL == "" {
-		st.Geo.GeoSiteURL = "https://github.com/Chocolate4U/Iran-v2ray-rules/releases/latest/download/geosite.dat"
+	} else if !activeExists {
+		st.ActiveNode = ""
 	}
 
 	cachedState = st
@@ -980,6 +2386,157 @@ func saveState(st PanelState) error {
 	}
 
 	return nil
+}
+
+func createBackupBundle() ([]byte, error) {
+	st := loadState()
+
+	rawCfg, err := os.ReadFile(BaseConfig)
+	if err != nil || len(bytes.TrimSpace(rawCfg)) == 0 {
+		rawCfg, err = os.ReadFile(PersistBaseConfig)
+	}
+	if err != nil || len(bytes.TrimSpace(rawCfg)) == 0 {
+		rawCfg = []byte(DefaultBaseConfigJSON)
+	}
+
+	var cfgObj map[string]interface{}
+	if err := json.Unmarshal(rawCfg, &cfgObj); err != nil {
+		return nil, fmt.Errorf("invalid base config.json: %w", err)
+	}
+	compactCfg, err := json.Marshal(cfgObj)
+	if err != nil {
+		return nil, err
+	}
+
+	bundle := BackupBundle{
+		Format:        "passwall-android-backup",
+		Version:       1,
+		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
+		ModuleVersion: getModuleVersion(),
+		State:         &st,
+		Config:        json.RawMessage(compactCfg),
+	}
+	return json.MarshalIndent(bundle, "", "  ")
+}
+
+func restoreBackupBundle(raw []byte) (PanelState, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return PanelState{}, false, fmt.Errorf("backup file is empty")
+	}
+
+	// Support optional wrapper {"backup_json": "..."}
+	var wrapper struct {
+		BackupJSON string `json:"backup_json"`
+	}
+	if err := json.Unmarshal(trimmed, &wrapper); err == nil && strings.TrimSpace(wrapper.BackupJSON) != "" {
+		trimmed = bytes.TrimSpace([]byte(wrapper.BackupJSON))
+	}
+
+	var topObj map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &topObj); err != nil || topObj == nil {
+		return PanelState{}, false, fmt.Errorf("invalid backup JSON: %v", err)
+	}
+
+	var bundle BackupBundle
+	if err := json.Unmarshal(trimmed, &bundle); err != nil {
+		return PanelState{}, false, fmt.Errorf("malformed backup structure: %v", err)
+	}
+
+	if bundle.Format != "" && bundle.Format != "passwall-android-backup" {
+		return PanelState{}, false, fmt.Errorf("unsupported backup format %q", bundle.Format)
+	}
+	if bundle.Version > 1 {
+		return PanelState{}, false, fmt.Errorf("unsupported backup version %d", bundle.Version)
+	}
+
+	restoredState := PanelState{
+		ProxyMode:      "rule",
+		AppFilterMode:  "bypass",
+		LocalhostProxy: true,
+		SelectedUIDs:   []int{},
+		Nodes:          []NodeProfile{},
+	}
+
+	hasState := false
+	if rawState, ok := topObj["state"]; ok && len(bytes.TrimSpace(rawState)) > 0 && string(bytes.TrimSpace(rawState)) != "null" {
+		if err := json.Unmarshal(rawState, &restoredState); err != nil {
+			return PanelState{}, false, fmt.Errorf("invalid backup state payload: %v", err)
+		}
+		hasState = true
+	} else if _, hasNodes := topObj["nodes"]; hasNodes || topObj["proxy_mode"] != nil || topObj["dns"] != nil || topObj["geo"] != nil {
+		// Also accept a raw state.json directly
+		if err := json.Unmarshal(trimmed, &restoredState); err != nil {
+			return PanelState{}, false, fmt.Errorf("invalid state JSON: %v", err)
+		}
+		hasState = true
+	}
+
+	var prettyConfig []byte
+	hasConfig := false
+	if len(bytes.TrimSpace(bundle.Config)) > 0 && string(bytes.TrimSpace(bundle.Config)) != "null" {
+		var cfgObj map[string]interface{}
+		if err := json.Unmarshal(bundle.Config, &cfgObj); err != nil || cfgObj == nil {
+			return PanelState{}, false, fmt.Errorf("invalid backup config.json payload")
+		}
+		var err error
+		prettyConfig, err = json.MarshalIndent(cfgObj, "", "  ")
+		if err != nil {
+			return PanelState{}, false, err
+		}
+		hasConfig = true
+	} else if !hasState && topObj["inbounds"] != nil && topObj["outbounds"] != nil {
+		var cfgObj map[string]interface{}
+		if err := json.Unmarshal(trimmed, &cfgObj); err != nil || cfgObj == nil {
+			return PanelState{}, false, fmt.Errorf("invalid config.json payload")
+		}
+		var err error
+		prettyConfig, err = json.MarshalIndent(cfgObj, "", "  ")
+		if err != nil {
+			return PanelState{}, false, err
+		}
+		hasConfig = true
+	}
+
+	if !hasState && !hasConfig {
+		return PanelState{}, false, fmt.Errorf("unrecognized backup file: missing state or config")
+	}
+
+	if hasConfig {
+		_ = os.MkdirAll(filepath.Dir(BaseConfig), 0755)
+		if err := writeSyncedFile(BaseConfig, prettyConfig); err != nil {
+			return PanelState{}, false, fmt.Errorf("failed writing base config: %w", err)
+		}
+		if errDir := os.MkdirAll(PersistDir, 0755); errDir == nil {
+			_ = writeSyncedFile(PersistBaseConfig, prettyConfig)
+		}
+	}
+
+	if hasState {
+		sanitizePanelState(&restoredState)
+		activeExists := false
+		for _, n := range restoredState.Nodes {
+			if n.ID == restoredState.ActiveNode {
+				activeExists = true
+				break
+			}
+		}
+		if !activeExists {
+			if len(restoredState.Nodes) > 0 {
+				restoredState.ActiveNode = restoredState.Nodes[0].ID
+			} else {
+				restoredState.ActiveNode = ""
+			}
+		}
+		if err := saveState(restoredState); err != nil {
+			return PanelState{}, hasConfig, fmt.Errorf("failed saving restored state: %w", err)
+		}
+	} else {
+		restoredState = loadState()
+	}
+
+	log.Printf("[passwall-droid] backup restored (state=%v, config=%v, nodes=%d)", hasState, hasConfig, len(restoredState.Nodes))
+	return restoredState, hasConfig, nil
 }
 
 func listInstalledApps() []AndroidApp {
@@ -1048,10 +2605,9 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 	if directDNS == "" {
 		directDNS = "1.1.1.1"
 	}
-	queryStrategy := strings.TrimSpace(st.DNS.QueryStrategy)
-	if queryStrategy == "" {
-		queryStrategy = "UseIPv4"
-	}
+	directQueryStrategy := st.DNS.EffectiveDirectQueryStrategy()
+	remoteQueryStrategy := st.DNS.EffectiveRemoteQueryStrategy()
+	queryStrategy := combinedTopLevelQueryStrategy(directQueryStrategy, remoteQueryStrategy)
 
 	// Identify active node domain and IP (if any)
 	var activeNodeDomain string
@@ -1073,94 +2629,76 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		defaultOutbound = "direct"
 	}
 
-	// Prepare direct domains (domestic Iranian/CN domains, custom direct domains, node domain, sub domain)
-	var directDomains []string
-	if st.Geo.IsBypassIran() {
-		directDomains = append(directDomains, "domain:ir", "geosite:ir", "geosite:category-ir")
-	}
-	if st.Geo.IsBypassCN() {
-		directDomains = append(directDomains, "geosite:cn")
-	}
-	for _, d := range st.Geo.DirectDomains {
-		d = strings.TrimSpace(d)
-		if d != "" {
-			directDomains = append(directDomains, d)
-		}
-	}
-	if activeNodeDomain != "" {
-		directDomains = append(directDomains, activeNodeDomain)
-	}
-	var subHost string
-	if st.SubURL != "" {
-		if subU, err := url.Parse(st.SubURL); err == nil && subU.Hostname() != "" {
-			subHost = subU.Hostname()
-			if net.ParseIP(subHost) == nil {
-				directDomains = append(directDomains, subHost)
+	if st.ActiveNode != "" {
+		for _, n := range st.Nodes {
+			if n.ID == st.ActiveNode && n.Outbound != nil {
+				outCopy := deepCloneMap(n.Outbound)
+				outCopy["tag"] = "proxy"
+				if outbounds, ok := cfg["outbounds"].([]interface{}); ok {
+					replaced := false
+					for i, item := range outbounds {
+						if ob, ok := item.(map[string]interface{}); ok && ob["tag"] == "proxy" {
+							outbounds[i] = outCopy
+							replaced = true
+							break
+						}
+					}
+					if !replaced {
+						cfg["outbounds"] = append([]interface{}{outCopy}, outbounds...)
+					}
+				} else {
+					cfg["outbounds"] = []interface{}{outCopy}
+				}
+				break
 			}
 		}
 	}
 
-	var dnsServers []interface{}
-	switch st.ProxyMode {
-	case "rule":
-		if defaultOutbound == "direct" {
-			dnsServers = []interface{}{
-				directDNS,
-				"1.1.1.1",
-				"localhost",
-			}
-		} else {
-			dnsServers = []interface{}{
-				map[string]interface{}{
-					"address":      directDNS,
-					"domains":      directDomains,
-					"skipFallback": false,
-				},
-				map[string]interface{}{
-					"address": remoteDNS,
-				},
-				directDNS,
-				"localhost",
-			}
-		}
-	case "global":
-		if defaultOutbound == "direct" {
-			dnsServers = []interface{}{
-				directDNS,
-				"1.1.1.1",
-				"localhost",
-			}
-		} else {
-			dnsServers = []interface{}{
-				map[string]interface{}{
-					"address":      directDNS,
-					"domains":      directDomains,
-					"skipFallback": false,
-				},
-				map[string]interface{}{
-					"address": remoteDNS,
-				},
-				"localhost",
+	// Ensure outbounds 'direct' and 'proxy' have mark set so packets never loop into Netfilter
+	if outbounds, ok := cfg["outbounds"].([]interface{}); ok {
+		for _, item := range outbounds {
+			if ob, ok := item.(map[string]interface{}); ok {
+				tag, _ := ob["tag"].(string)
+				if tag == "direct" || tag == "proxy" {
+					ss, _ := ob["streamSettings"].(map[string]interface{})
+					if ss == nil {
+						ss = map[string]interface{}{}
+						ob["streamSettings"] = ss
+					}
+					sockopt, _ := ss["sockopt"].(map[string]interface{})
+					if sockopt == nil {
+						sockopt = map[string]interface{}{}
+						ss["sockopt"] = sockopt
+					}
+					sockopt["mark"] = BypassMark
+
+					// Migrate deprecated freedom.domainStrategy to sockopt.domainStrategy
+					if proto, _ := ob["protocol"].(string); proto == "freedom" || tag == "direct" {
+						if settings, ok := ob["settings"].(map[string]interface{}); ok {
+							if ds, ok := settings["domainStrategy"].(string); ok && ds != "" {
+								sockopt["domainStrategy"] = ds
+								delete(settings, "domainStrategy")
+							}
+						}
+						if tag == "direct" || sockopt["domainStrategy"] == nil || sockopt["domainStrategy"] == "" {
+							sockopt["domainStrategy"] = directQueryStrategy
+						}
+					}
+				}
 			}
 		}
-	case "direct":
-		dnsServers = []interface{}{
-			directDNS,
-			"1.1.1.1",
-			"localhost",
-		}
-	}
-	cfg["dns"] = map[string]interface{}{
-		"servers":       dnsServers,
-		"queryStrategy": queryStrategy,
 	}
 
+	usedInboundPorts := map[int]bool{1053: true, 12345: true, 10808: true}
 	if inbounds, ok := cfg["inbounds"].([]interface{}); ok {
 		hasSocks := false
 		for _, item := range inbounds {
 			inb, ok := item.(map[string]interface{})
 			if !ok {
 				continue
+			}
+			if p := jsonIntValue(inb["port"]); p > 0 {
+				usedInboundPorts[p] = true
 			}
 			if tag, _ := inb["tag"].(string); tag == "socks-in" {
 				hasSocks = true
@@ -1242,82 +2780,179 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		}
 	}
 
-	if st.ActiveNode != "" {
-		for _, n := range st.Nodes {
-			if n.ID == st.ActiveNode && n.Outbound != nil {
-				outCopy := map[string]interface{}{}
-				for k, v := range n.Outbound {
-					outCopy[k] = v
+	var bridgeInbounds []interface{}
+	var bridgeRules []interface{}
+	var extraDirectDomains []string
+	var extraDirectIPs []string
+	if st.AllowInsecureVless {
+		nextBridgePort := 10819
+		if outbounds, ok := cfg["outbounds"].([]interface{}); ok {
+			for _, item := range outbounds {
+				ob, ok := item.(map[string]interface{})
+				if !ok {
+					continue
 				}
-				outCopy["tag"] = "proxy"
-				if outbounds, ok := cfg["outbounds"].([]interface{}); ok {
-					replaced := false
-					for i, item := range outbounds {
-						if ob, ok := item.(map[string]interface{}); ok && ob["tag"] == "proxy" {
-							outbounds[i] = outCopy
-							replaced = true
-							break
-						}
-					}
-					if !replaced {
-						cfg["outbounds"] = append([]interface{}{outCopy}, outbounds...)
-					}
+				origHost, dialAddr, dialPort, needs := vlessOutboundNeedsSecurityBypass(ob)
+				if !needs {
+					continue
 				}
-				break
+				bridgePort := allocateFreeLoopbackPort(nextBridgePort, usedInboundPorts)
+				usedInboundPorts[bridgePort] = true
+				nextBridgePort = bridgePort + 1
+
+				preserveVlessTransportHost(ob, origHost)
+				rewriteVlessOutboundTarget(ob, "127.0.0.1", bridgePort)
+
+				bridgeTag := fmt.Sprintf("vless-plain-bridge-%d", len(bridgeInbounds))
+				bridgeInbounds = append(bridgeInbounds, map[string]interface{}{
+					"tag":      bridgeTag,
+					"listen":   "127.0.0.1",
+					"port":     bridgePort,
+					"protocol": "dokodemo-door",
+					"settings": map[string]interface{}{
+						"network": "tcp,udp",
+						"address": dialAddr,
+						"port":    dialPort,
+					},
+				})
+				bridgeRules = append(bridgeRules, map[string]interface{}{
+					"type":        "field",
+					"inboundTag":  []string{bridgeTag},
+					"outboundTag": "direct",
+				})
+
+				if net.ParseIP(dialAddr) == nil {
+					if dialAddr != activeNodeDomain {
+						extraDirectDomains = append(extraDirectDomains, dialAddr)
+					}
+				} else if dialAddr != activeNodeIP {
+					extraDirectIPs = append(extraDirectIPs, dialAddr)
+				}
+
+				tag, _ := ob["tag"].(string)
+				log.Printf("[passwall-droid] VLESS TLS/encryption bypass enabled for outbound %q (%s:%d -> 127.0.0.1:%d)", tag, dialAddr, dialPort, bridgePort)
+			}
+		}
+		if len(bridgeInbounds) > 0 {
+			if inbList, ok := cfg["inbounds"].([]interface{}); ok {
+				cfg["inbounds"] = append(inbList, bridgeInbounds...)
+			} else {
+				cfg["inbounds"] = bridgeInbounds
 			}
 		}
 	}
 
-	// Ensure outbounds 'direct' and 'proxy' have mark set so packets never loop into Netfilter
-	if outbounds, ok := cfg["outbounds"].([]interface{}); ok {
-		for _, item := range outbounds {
-			if ob, ok := item.(map[string]interface{}); ok {
-				tag, _ := ob["tag"].(string)
-				if tag == "direct" || tag == "proxy" {
-					ss, _ := ob["streamSettings"].(map[string]interface{})
-					if ss == nil {
-						ss = map[string]interface{}{}
-						ob["streamSettings"] = ss
-					}
-					sockopt, _ := ss["sockopt"].(map[string]interface{})
-					if sockopt == nil {
-						sockopt = map[string]interface{}{}
-						ss["sockopt"] = sockopt
-					}
-					sockopt["mark"] = BypassMark
-
-					// Migrate deprecated freedom.domainStrategy to sockopt.domainStrategy
-					if proto, _ := ob["protocol"].(string); proto == "freedom" || tag == "direct" {
-						if settings, ok := ob["settings"].(map[string]interface{}); ok {
-							if ds, ok := settings["domainStrategy"].(string); ok && ds != "" {
-								sockopt["domainStrategy"] = ds
-								delete(settings, "domainStrategy")
-							}
-						}
-						if sockopt["domainStrategy"] == nil || sockopt["domainStrategy"] == "" {
-							sockopt["domainStrategy"] = queryStrategy
-						}
-					}
-				}
+	// Prepare direct domains (domestic Iranian/CN domains, custom direct domains, node domain, sub domain)
+	var directDomains []string
+	if st.Geo.IsBypassIran() {
+		directDomains = append(directDomains, "domain:ir", "geosite:ir", "geosite:category-ir")
+	}
+	if st.Geo.IsBypassCN() {
+		directDomains = append(directDomains, "geosite:cn")
+	}
+	for _, d := range st.Geo.DirectDomains {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			directDomains = append(directDomains, d)
+		}
+	}
+	if activeNodeDomain != "" {
+		directDomains = append(directDomains, activeNodeDomain)
+	}
+	directDomains = append(directDomains, extraDirectDomains...)
+	var subHost string
+	if st.SubURL != "" {
+		if subU, err := url.Parse(st.SubURL); err == nil && subU.Hostname() != "" {
+			subHost = subU.Hostname()
+			if net.ParseIP(subHost) == nil {
+				directDomains = append(directDomains, subHost)
 			}
 		}
+	}
+
+	buildDirectDNSServer := func(addr string, withDomains bool) map[string]interface{} {
+		entry := map[string]interface{}{
+			"address":       addr,
+			"queryStrategy": directQueryStrategy,
+		}
+		if withDomains {
+			entry["domains"] = directDomains
+			entry["skipFallback"] = false
+		}
+		return entry
+	}
+	buildRemoteDNSServer := func(addr string) map[string]interface{} {
+		return map[string]interface{}{
+			"address":       addr,
+			"queryStrategy": remoteQueryStrategy,
+		}
+	}
+
+	var dnsServers []interface{}
+	switch st.ProxyMode {
+	case "rule":
+		if defaultOutbound == "direct" {
+			dnsServers = []interface{}{
+				buildDirectDNSServer(directDNS, false),
+				buildDirectDNSServer("1.1.1.1", false),
+				"localhost",
+			}
+		} else {
+			dnsServers = []interface{}{
+				buildDirectDNSServer(directDNS, true),
+				buildRemoteDNSServer(remoteDNS),
+				buildDirectDNSServer(directDNS, false),
+				"localhost",
+			}
+		}
+	case "global":
+		if defaultOutbound == "direct" {
+			dnsServers = []interface{}{
+				buildDirectDNSServer(directDNS, false),
+				buildDirectDNSServer("1.1.1.1", false),
+				"localhost",
+			}
+		} else {
+			dnsServers = []interface{}{
+				buildDirectDNSServer(directDNS, true),
+				buildRemoteDNSServer(remoteDNS),
+				"localhost",
+			}
+		}
+	case "direct":
+		dnsServers = []interface{}{
+			buildDirectDNSServer(directDNS, false),
+			buildDirectDNSServer("1.1.1.1", false),
+			"localhost",
+		}
+	}
+	cfg["dns"] = map[string]interface{}{
+		"servers":       dnsServers,
+		"queryStrategy": queryStrategy,
 	}
 
 	var rules []interface{}
-	// 1. Intercept all inbound DNS to Xray internal DNS (dns-in dedicated port 1053, and port 53 for tproxy/socks)
+	if len(bridgeRules) > 0 {
+		rules = append(rules, bridgeRules...)
+	}
+	// 1. Intercept inbound DNS to Xray internal DNS (dns-in port 1053 always; tproxy/socks port 53 when DNS Redirect is enabled)
 	rules = append(rules,
 		map[string]interface{}{
 			"type":        "field",
 			"inboundTag":  []string{"dns-in"},
 			"outboundTag": "dns-out",
 		},
-		map[string]interface{}{
-			"type":        "field",
-			"inboundTag":  []string{"tproxy-in", "socks-in"},
-			"port":        "53",
-			"outboundTag": "dns-out",
-		},
 	)
+	if st.DNS.IsDNSRedirect() {
+		rules = append(rules,
+			map[string]interface{}{
+				"type":        "field",
+				"inboundTag":  []string{"tproxy-in", "socks-in"},
+				"port":        "53",
+				"outboundTag": "dns-out",
+			},
+		)
+	}
 
 	// 2. Direct DNS server traffic must ALWAYS go to direct outbound (port 53)
 	directHost := extractHost(directDNS)
@@ -1369,7 +3004,7 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		}
 	}
 
-	// 3. Active node and sub URL domain / IP must go to direct outbound (prevent proxy loop/deadlock)
+	// 3. Active node, bridged VLESS targets, and sub URL domain / IP must go to direct outbound (prevent proxy loop/deadlock)
 	if activeNodeDomain != "" {
 		rules = append(rules, map[string]interface{}{
 			"type":        "field",
@@ -1377,10 +3012,24 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 			"outboundTag": "direct",
 		})
 	}
+	if len(extraDirectDomains) > 0 {
+		rules = append(rules, map[string]interface{}{
+			"type":        "field",
+			"domain":      sanitizeStringList(extraDirectDomains),
+			"outboundTag": "direct",
+		})
+	}
 	if activeNodeIP != "" {
 		rules = append(rules, map[string]interface{}{
 			"type":        "field",
 			"ip":          []string{activeNodeIP},
+			"outboundTag": "direct",
+		})
+	}
+	if len(extraDirectIPs) > 0 {
+		rules = append(rules, map[string]interface{}{
+			"type":        "field",
+			"ip":          sanitizeStringList(extraDirectIPs),
 			"outboundTag": "direct",
 		})
 	}
@@ -1567,7 +3216,8 @@ func prepareRuntimeConfig(tproxySupported bool) error {
 		routing = map[string]interface{}{}
 		cfg["routing"] = routing
 	}
-	routing["domainStrategy"] = "IPIfNonMatch"
+	routing["domainStrategy"] = st.Geo.EffectiveDomainStrategy()
+	routing["domainMatcher"] = st.Geo.EffectiveDomainMatcher()
 	routing["rules"] = rules
 
 	finalBytes, err := json.MarshalIndent(cfg, "", "  ")
@@ -1644,8 +3294,23 @@ func cleanupPolicyRouting() {
 	runCmdIgnoreErr("ip", "-4", "route", "flush", "table", strconv.Itoa(RouteTable))
 }
 
+func setupDoTBlockIptables(st PanelState) {
+	if !st.DNS.IsDNSRedirect() {
+		return
+	}
+	// Reject DNS-over-TLS (port 853) so Android falls back immediately to port 53 DNS intercepted by Xray.
+	_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
+	if st.LocalhostProxy {
+		_ = runCmd("iptables", "-I", "OUTPUT", "1",
+			"-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
+			"-m", "mark", "!", "--mark", BypassHex+"/"+BypassHex,
+			"-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
+	}
+}
+
 func setupTproxyIptables() error {
 	st := loadState()
+	dnsRedirect := st.DNS.IsDNSRedirect()
 	tproxyTarget := strconv.Itoa(TproxyPort)
 	markSpec := FwMark + "/" + FwMask
 
@@ -1667,9 +3332,14 @@ func setupTproxyIptables() error {
 		"-m", "mark", "--mark", BypassHex+"/"+BypassHex, "-j", "RETURN")
 
 	for _, proto := range []string{"tcp", "udp"} {
-		_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_PRE",
-			"-p", proto, "--dport", "53",
-			"-j", "TPROXY", "--on-port", tproxyTarget, "--on-ip", "127.0.0.1", "--tproxy-mark", markSpec)
+		if dnsRedirect {
+			_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_PRE",
+				"-p", proto, "--dport", "53",
+				"-j", "TPROXY", "--on-port", tproxyTarget, "--on-ip", "127.0.0.1", "--tproxy-mark", markSpec)
+		} else {
+			_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_PRE",
+				"-p", proto, "--dport", "53", "-j", "RETURN")
+		}
 	}
 
 	for _, cidr := range bypassCIDRsV4 {
@@ -1688,9 +3358,14 @@ func setupTproxyIptables() error {
 		_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT", "-j", "RETURN")
 	} else {
 		for _, proto := range []string{"tcp", "udp"} {
-			_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
-				"-p", proto, "--dport", "53",
-				"-j", "MARK", "--set-xmark", markSpec)
+			if dnsRedirect {
+				_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
+					"-p", proto, "--dport", "53",
+					"-j", "MARK", "--set-xmark", markSpec)
+			} else {
+				_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT",
+					"-p", proto, "--dport", "53", "-j", "RETURN")
+			}
 		}
 		for _, cidr := range bypassCIDRsV4 {
 			_ = runCmd("iptables", "-t", "mangle", "-A", "PASSWALL_OUT", "-d", cidr, "-j", "RETURN")
@@ -1729,14 +3404,7 @@ func setupTproxyIptables() error {
 		}
 	}
 
-	// Reject DNS-over-TLS (port 853) so Android falls back immediately to port 53 DNS intercepted by Xray
-	_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
-	if st.LocalhostProxy {
-		_ = runCmd("iptables", "-I", "OUTPUT", "1",
-			"-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
-			"-m", "mark", "!", "--mark", BypassHex+"/"+BypassHex,
-			"-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
-	}
+	setupDoTBlockIptables(st)
 
 	if err := runCmd("iptables", "-t", "mangle", "-I", "PREROUTING", "1", "-j", "PASSWALL_PRE"); err != nil {
 		return err
@@ -1766,6 +3434,7 @@ func setupTproxyIptables() error {
 
 func setupRedirectIptables() error {
 	st := loadState()
+	dnsRedirect := st.DNS.IsDNSRedirect()
 	redirPort := strconv.Itoa(TproxyPort)
 
 	if err := runCmd("iptables", "-t", "nat", "-N", "PASSWALL_NAT_PRE"); err != nil {
@@ -1781,8 +3450,13 @@ func setupRedirectIptables() error {
 		"-m", "mark", "--mark", BypassHex+"/"+BypassHex, "-j", "RETURN")
 
 	for _, proto := range []string{"udp", "tcp"} {
-		_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_PRE",
-			"-p", proto, "--dport", "53", "-j", "REDIRECT", "--to-ports", "1053")
+		if dnsRedirect {
+			_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_PRE",
+				"-p", proto, "--dport", "53", "-j", "REDIRECT", "--to-ports", "1053")
+		} else {
+			_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_PRE",
+				"-p", proto, "--dport", "53", "-j", "RETURN")
+		}
 	}
 
 	for _, cidr := range bypassCIDRsV4 {
@@ -1799,14 +3473,7 @@ func setupRedirectIptables() error {
 		}
 	}
 
-	// Reject DNS-over-TLS (port 853) so Android falls back immediately to port 53 DNS intercepted by Xray
-	_ = runCmd("iptables", "-I", "FORWARD", "1", "-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
-	if st.LocalhostProxy {
-		_ = runCmd("iptables", "-I", "OUTPUT", "1",
-			"-m", "owner", "!", "--gid-owner", strconv.Itoa(XrayGID),
-			"-m", "mark", "!", "--mark", BypassHex+"/"+BypassHex,
-			"-p", "tcp", "--dport", "853", "-j", "REJECT", "--reject-with", "tcp-reset")
-	}
+	setupDoTBlockIptables(st)
 
 	if err := runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_PRE",
 		"-p", "tcp", "-j", "REDIRECT", "--to-ports", redirPort); err != nil {
@@ -1817,8 +3484,13 @@ func setupRedirectIptables() error {
 		_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT", "-j", "RETURN")
 	} else {
 		for _, proto := range []string{"udp", "tcp"} {
-			_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT",
-				"-p", proto, "--dport", "53", "-j", "REDIRECT", "--to-ports", "1053")
+			if dnsRedirect {
+				_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT",
+					"-p", proto, "--dport", "53", "-j", "REDIRECT", "--to-ports", "1053")
+			} else {
+				_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT",
+					"-p", proto, "--dport", "53", "-j", "RETURN")
+			}
 		}
 		for _, cidr := range bypassCIDRsV4 {
 			_ = runCmd("iptables", "-t", "nat", "-A", "PASSWALL_NAT_OUT", "-d", cidr, "-j", "RETURN")
@@ -2308,18 +3980,24 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 		uuid, _ := v["id"].(string)
 		ps, _ := v["ps"].(string)
 		netType, _ := v["net"].(string)
+		hdrType, _ := v["type"].(string)
 		tlsType, _ := v["tls"].(string)
 		host, _ := v["host"].(string)
 		path, _ := v["path"].(string)
 		sni, _ := v["sni"].(string)
-		port := 443
-		switch p := v["port"].(type) {
-		case float64:
-			port = int(p)
-		case string:
-			if parsed, err := strconv.Atoi(p); err == nil {
-				port = parsed
-			}
+		fp, _ := v["fp"].(string)
+		alpn, _ := v["alpn"].(string)
+		scy, _ := v["scy"].(string)
+		if scy == "" {
+			scy = "auto"
+		}
+		aid := jsonIntValue(v["aid"])
+		if aid < 0 {
+			aid = 0
+		}
+		port := jsonIntValue(v["port"])
+		if port <= 0 {
+			port = 443
 		}
 		if ps == "" {
 			ps = fmt.Sprintf("vmess-%s:%d", addr, port)
@@ -2327,22 +4005,87 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 		if netType == "" {
 			netType = "tcp"
 		}
+		if netType == "splithttp" {
+			netType = "xhttp"
+		}
 		ss := map[string]interface{}{"network": netType}
-		if tlsType == "tls" {
+		if strings.EqualFold(tlsType, "tls") {
 			ss["security"] = "tls"
 			if sni == "" {
 				sni = host
 			}
+			tlsSet := map[string]interface{}{}
 			if sni != "" {
-				ss["tlsSettings"] = map[string]interface{}{"serverName": sni}
+				tlsSet["serverName"] = sni
 			}
+			if fp != "" {
+				tlsSet["fingerprint"] = fp
+			}
+			if alpnArr := parseALPNList(alpn); len(alpnArr) > 0 {
+				tlsSet["alpn"] = alpnArr
+			}
+			allowInsec := false
+			switch ai := v["allowInsecure"].(type) {
+			case bool:
+				allowInsec = ai
+			case float64:
+				allowInsec = ai != 0
+			case string:
+				allowInsec = ai == "1" || strings.EqualFold(ai, "true")
+			}
+			if !allowInsec {
+				if insecStr, ok := v["insecure"].(string); ok {
+					allowInsec = insecStr == "1" || strings.EqualFold(insecStr, "true")
+				}
+			}
+			if allowInsec {
+				tlsSet["allowInsecure"] = true
+			}
+			ss["tlsSettings"] = tlsSet
 		}
-		if netType == "ws" {
+		switch netType {
+		case "ws":
 			ws := map[string]interface{}{"path": path}
 			if host != "" {
 				ws["headers"] = map[string]interface{}{"Host": host}
 			}
 			ss["wsSettings"] = ws
+		case "xhttp":
+			xh := map[string]interface{}{"path": path}
+			if host != "" {
+				xh["host"] = host
+			}
+			ss["xhttpSettings"] = xh
+		case "httpupgrade":
+			hu := map[string]interface{}{"path": path}
+			if host != "" {
+				hu["host"] = host
+			}
+			ss["httpupgradeSettings"] = hu
+		case "grpc":
+			gs := map[string]interface{}{"serviceName": path}
+			if hdrType == "multi" {
+				gs["multiMode"] = true
+			}
+			ss["grpcSettings"] = gs
+		case "tcp":
+			if hdrType == "http" {
+				reqPath := path
+				if reqPath == "" {
+					reqPath = "/"
+				}
+				reqHdr := map[string]interface{}{
+					"version": "1.1",
+					"method":  "GET",
+					"path":    []interface{}{reqPath},
+				}
+				if host != "" {
+					reqHdr["headers"] = map[string]interface{}{"Host": []interface{}{host}}
+				}
+				ss["tcpSettings"] = map[string]interface{}{
+					"header": map[string]interface{}{"type": "http", "request": reqHdr},
+				}
+			}
 		}
 		ob := map[string]interface{}{
 			"tag":      "proxy",
@@ -2353,7 +4096,7 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 						"address": addr,
 						"port":    port,
 						"users": []interface{}{
-							map[string]interface{}{"id": uuid, "alterId": 0, "security": "auto"},
+							map[string]interface{}{"id": uuid, "alterId": aid, "security": scy},
 						},
 					},
 				},
@@ -2457,6 +4200,9 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 	var userID string
 	if u.User != nil {
 		userID = u.User.Username()
+		if pw, hasPw := u.User.Password(); hasPw && proto == "trojan" {
+			userID = userID + ":" + pw
+		}
 	}
 
 	q := u.Query()
@@ -2589,16 +4335,19 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 		}, nil
 	}
 
-	netType := q.Get("type")
+	netType := strings.ToLower(q.Get("type"))
 	if netType == "" {
 		netType = "tcp"
 	}
-	security := q.Get("security")
+	security := strings.ToLower(q.Get("security"))
 	sni := q.Get("sni")
 	if sni == "" {
 		sni = q.Get("host")
 	}
 	fp := q.Get("fp")
+	if fp == "" {
+		fp = q.Get("fingerprint")
+	}
 	path := q.Get("path")
 	if path == "" {
 		path = "/"
@@ -2615,6 +4364,19 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 		}
 		if fp != "" {
 			tlsSet["fingerprint"] = fp
+		}
+		if alpnArr := parseALPNList(q.Get("alpn")); len(alpnArr) > 0 {
+			tlsSet["alpn"] = alpnArr
+		}
+		insecVal := q.Get("allowInsecure")
+		if insecVal == "" {
+			insecVal = q.Get("insecure")
+		}
+		if insecVal == "1" || strings.EqualFold(insecVal, "true") {
+			tlsSet["allowInsecure"] = true
+		}
+		if pin := q.Get("pinSHA256"); pin != "" {
+			tlsSet["pinnedPeerCertificateSha256"] = pin
 		}
 		ss["security"] = "tls"
 		ss["tlsSettings"] = tlsSet
@@ -2633,6 +4395,21 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 	}
 
 	switch netType {
+	case "tcp", "raw":
+		ss["network"] = "tcp"
+		if strings.EqualFold(q.Get("headerType"), "http") {
+			reqHdr := map[string]interface{}{
+				"version": "1.1",
+				"method":  "GET",
+				"path":    []interface{}{path},
+			}
+			if host != "" {
+				reqHdr["headers"] = map[string]interface{}{"Host": []interface{}{host}}
+			}
+			ss["tcpSettings"] = map[string]interface{}{
+				"header": map[string]interface{}{"type": "http", "request": reqHdr},
+			}
+		}
 	case "ws":
 		ws := map[string]interface{}{"path": path}
 		if host != "" {
@@ -2649,17 +4426,43 @@ func parseShareURI(rawURI string, group string) (NodeProfile, error) {
 		}
 		ss["network"] = "xhttp"
 		ss["xhttpSettings"] = xh
+	case "httpupgrade":
+		hu := map[string]interface{}{"path": path}
+		if host != "" {
+			hu["host"] = host
+		}
+		ss["httpupgradeSettings"] = hu
 	case "grpc":
-		ss["grpcSettings"] = map[string]interface{}{
+		gs := map[string]interface{}{
 			"serviceName": q.Get("serviceName"),
 		}
+		if strings.EqualFold(q.Get("mode"), "multi") {
+			gs["multiMode"] = true
+		}
+		if auth := q.Get("authority"); auth != "" {
+			gs["authority"] = auth
+		}
+		ss["grpcSettings"] = gs
+	case "kcp":
+		ks := map[string]interface{}{}
+		if ht := q.Get("headerType"); ht != "" && ht != "none" {
+			ks["header"] = map[string]interface{}{"type": ht}
+		}
+		if seed := q.Get("seed"); seed != "" {
+			ks["seed"] = seed
+		}
+		ss["kcpSettings"] = ks
 	}
 
 	var settings map[string]interface{}
 	if proto == "vless" {
+		enc := strings.TrimSpace(q.Get("encryption"))
+		if enc == "" {
+			enc = "none"
+		}
 		userObj := map[string]interface{}{
 			"id":         userID,
-			"encryption": "none",
+			"encryption": enc,
 		}
 		if flow := q.Get("flow"); flow != "" {
 			userObj["flow"] = flow
@@ -3039,7 +4842,7 @@ func checkConnectivity() ConnectivityStatus {
 	return res
 }
 
-func startWebDashboard() {
+func buildWebMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -3075,33 +4878,35 @@ func startWebDashboard() {
 		}
 
 		resp := map[string]interface{}{
-			"running":           active,
-			"daemon_pid":        daemonPID,
-			"net_mode":          netMode,
-			"proxy_mode":        st.ProxyMode,
-			"active_node":       st.ActiveNode,
-			"sub_url":           st.SubURL,
-			"sub_insecure":      st.SubInsecure,
-			"auto_update_hours": st.AutoUpdateHours,
-			"last_sub_update":   st.LastSubUpdate,
-			"app_filter_mode":   st.AppFilterMode,
-			"selected_uids":     st.SelectedUIDs,
-			"localhost_proxy":   st.LocalhostProxy,
-			"dns":               st.DNS,
-			"geo":               st.Geo,
-			"module_version":    getModuleVersion(),
-			"xray_version":      getXrayVersion(),
-			"nodes":             st.Nodes,
-			"battery_pct":       batPct,
-			"battery_status":    batStatus,
-			"module_pid":        daemonPID,
-			"module_cpu":        modCPU,
-			"module_ram":        modRAMBytes,
-			"module_ram_str":    modRAMStr,
-			"xray_pid":          currentXrayPID,
-			"xray_cpu":          xrayCPU,
-			"xray_ram":          xrayRAMBytes,
-			"xray_ram_str":      xrayRAMStr,
+			"running":               active,
+			"daemon_pid":            daemonPID,
+			"net_mode":              netMode,
+			"proxy_mode":            st.ProxyMode,
+			"active_node":           st.ActiveNode,
+			"sub_url":               st.SubURL,
+			"sub_insecure":          st.SubInsecure,
+			"auto_update_hours":     st.AutoUpdateHours,
+			"last_sub_update":       st.LastSubUpdate,
+			"app_filter_mode":       st.AppFilterMode,
+			"selected_uids":         st.SelectedUIDs,
+			"localhost_proxy":       st.LocalhostProxy,
+			"allow_insecure_vless":  st.AllowInsecureVless,
+			"vless_insecure_needed": activeNodeNeedsVlessSecurityBypass(st),
+			"dns":                   st.DNS,
+			"geo":                   st.Geo,
+			"module_version":        getModuleVersion(),
+			"xray_version":          getXrayVersion(),
+			"nodes":                 st.Nodes,
+			"battery_pct":           batPct,
+			"battery_status":        batStatus,
+			"module_pid":            daemonPID,
+			"module_cpu":            modCPU,
+			"module_ram":            modRAMBytes,
+			"module_ram_str":        modRAMStr,
+			"xray_pid":              currentXrayPID,
+			"xray_cpu":              xrayCPU,
+			"xray_ram":              xrayRAMBytes,
+			"xray_ram_str":          xrayRAMStr,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -3197,6 +5002,125 @@ func startWebDashboard() {
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
+	mux.HandleFunc("/api/vless_insecure", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			AllowInsecureVless bool `json:"allow_insecure_vless"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		st := loadState()
+		st.AllowInsecureVless = req.AllowInsecureVless
+		if err := saveState(st); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		log.Printf("[passwall-droid] VLESS without TLS/encryption bypass set to %v", req.AllowInsecureVless)
+
+		engineMu.Lock()
+		active := engineActive
+		engineMu.Unlock()
+		if active {
+			_ = restartProxyEngine()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":               "ok",
+			"allow_insecure_vless": st.AllowInsecureVless,
+			"restarted":            active,
+		})
+	})
+
+	mux.HandleFunc("/api/backup", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", http.StatusMethodNotAllowed)
+			return
+		}
+		data, err := createBackupBundle()
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if r.URL.Query().Get("download") == "1" || r.URL.Query().Get("download") == "true" {
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"passwall-backup-%s.json\"", time.Now().Format("20060102-150405")))
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		}
+		_, _ = w.Write(data)
+	})
+
+	mux.HandleFunc("/api/restore", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		var rawData []byte
+		ct := strings.ToLower(r.Header.Get("Content-Type"))
+		if strings.HasPrefix(ct, "multipart/form-data") {
+			if err := r.ParseMultipartForm(16 << 20); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid multipart upload: " + err.Error()})
+				return
+			}
+			f, _, err := r.FormFile("file")
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Missing backup file field: " + err.Error()})
+				return
+			}
+			defer f.Close()
+			rawData, err = io.ReadAll(io.LimitReader(f, 16<<20))
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+		} else {
+			var err error
+			rawData, err = io.ReadAll(io.LimitReader(r.Body, 16<<20))
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+		}
+
+		restoredState, configRestored, err := restoreBackupBundle(rawData)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		engineMu.Lock()
+		active := engineActive
+		engineMu.Unlock()
+		if active {
+			_ = restartProxyEngine()
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":          "ok",
+			"nodes":           len(restoredState.Nodes),
+			"config_restored": configRestored,
+			"restarted":       active,
+		})
+	})
+
 	mux.HandleFunc("/api/connectivity", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		res := checkConnectivity()
@@ -3213,7 +5137,23 @@ func startWebDashboard() {
 		if r.Method == http.MethodPost {
 			var req DNSConfig
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			if s := strings.TrimSpace(req.QueryStrategy); s != "" && !isValidQueryStrategy(s) {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("invalid query_strategy %q (expected UseIP, UseIPv4, or UseIPv6)", s)})
+				return
+			}
+			if s := strings.TrimSpace(req.DirectQueryStrategy); s != "" && !isValidQueryStrategy(s) {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("invalid direct_query_strategy %q (expected UseIP, UseIPv4, or UseIPv6)", s)})
+				return
+			}
+			if s := strings.TrimSpace(req.RemoteQueryStrategy); s != "" && !isValidQueryStrategy(s) {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("invalid remote_query_strategy %q (expected UseIP, UseIPv4, or UseIPv6)", s)})
 				return
 			}
 			st := loadState()
@@ -3223,14 +5163,43 @@ func startWebDashboard() {
 			if strings.TrimSpace(req.DirectDNS) != "" {
 				st.DNS.DirectDNS = strings.TrimSpace(req.DirectDNS)
 			}
-			if strings.TrimSpace(req.QueryStrategy) != "" {
-				st.DNS.QueryStrategy = strings.TrimSpace(req.QueryStrategy)
+			legacyQS := strings.TrimSpace(req.QueryStrategy)
+			if s := strings.TrimSpace(req.DirectQueryStrategy); s != "" {
+				st.DNS.DirectQueryStrategy = s
+			} else if legacyQS != "" {
+				st.DNS.DirectQueryStrategy = legacyQS
 			}
-			_ = saveState(st)
-			log.Printf("[passwall-droid] updated DNS settings: remote=%s direct=%s strategy=%s",
-				st.DNS.RemoteDNS, st.DNS.DirectDNS, st.DNS.QueryStrategy)
-			_ = restartProxyEngine()
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+			if s := strings.TrimSpace(req.RemoteQueryStrategy); s != "" {
+				st.DNS.RemoteQueryStrategy = s
+			} else if legacyQS != "" {
+				st.DNS.RemoteQueryStrategy = legacyQS
+			}
+			if req.DNSRedirect != nil {
+				v := *req.DNSRedirect
+				st.DNS.DNSRedirect = &v
+			}
+			sanitizePanelState(&st)
+			if err := saveState(st); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			log.Printf("[passwall-droid] updated DNS settings: remote=%s (%s) direct=%s (%s) dns_redirect=%v",
+				st.DNS.RemoteDNS, st.DNS.EffectiveRemoteQueryStrategy(),
+				st.DNS.DirectDNS, st.DNS.EffectiveDirectQueryStrategy(),
+				st.DNS.IsDNSRedirect())
+
+			engineMu.Lock()
+			active := engineActive
+			engineMu.Unlock()
+			if active {
+				_ = restartProxyEngine()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":    "ok",
+				"dns":       st.DNS,
+				"restarted": active,
+			})
 			return
 		}
 		http.Error(w, "GET or POST required", http.StatusMethodNotAllowed)
@@ -3244,6 +5213,8 @@ func startWebDashboard() {
 				"bypass_iran":     st.Geo.IsBypassIran(),
 				"bypass_cn":       st.Geo.IsBypassCN(),
 				"block_ads":       st.Geo.IsBlockAds(),
+				"domain_strategy": st.Geo.EffectiveDomainStrategy(),
+				"domain_matcher":  st.Geo.EffectiveDomainMatcher(),
 				"direct_domains":  st.Geo.DirectDomains,
 				"direct_ips":      st.Geo.DirectIPs,
 				"proxy_domains":   st.Geo.ProxyDomains,
@@ -3260,21 +5231,33 @@ func startWebDashboard() {
 		}
 		if r.Method == http.MethodPost {
 			var req struct {
-				BypassIran    *bool    `json:"bypass_iran"`
-				BypassCN      *bool    `json:"bypass_cn"`
-				BlockAds      *bool    `json:"block_ads"`
-				DirectDomains []string `json:"direct_domains"`
-				DirectIPs     []string `json:"direct_ips"`
-				ProxyDomains  []string `json:"proxy_domains"`
-				ProxyIPs      []string `json:"proxy_ips"`
-				BlockDomains  []string `json:"block_domains"`
-				BlockIPs      []string `json:"block_ips"`
-				GeoIPURL      string   `json:"geoip_url"`
-				GeoSiteURL    string   `json:"geosite_url"`
+				BypassIran     *bool    `json:"bypass_iran"`
+				BypassCN       *bool    `json:"bypass_cn"`
+				BlockAds       *bool    `json:"block_ads"`
+				DomainStrategy string   `json:"domain_strategy"`
+				DomainMatcher  string   `json:"domain_matcher"`
+				DirectDomains  []string `json:"direct_domains"`
+				DirectIPs      []string `json:"direct_ips"`
+				ProxyDomains   []string `json:"proxy_domains"`
+				ProxyIPs       []string `json:"proxy_ips"`
+				BlockDomains   []string `json:"block_domains"`
+				BlockIPs       []string `json:"block_ips"`
+				GeoIPURL       string   `json:"geoip_url"`
+				GeoSiteURL     string   `json:"geosite_url"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				w.WriteHeader(http.StatusBadRequest)
 				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body: " + err.Error()})
+				return
+			}
+			if s := strings.TrimSpace(req.DomainStrategy); s != "" && !isValidDomainStrategy(s) {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("invalid domain_strategy %q (expected AsIs, IPIfNonMatch, or IPOnDemand)", s)})
+				return
+			}
+			if s := strings.TrimSpace(req.DomainMatcher); s != "" && !isValidDomainMatcher(s) {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("invalid domain_matcher %q (expected hybrid or linear)", s)})
 				return
 			}
 			st := loadState()
@@ -3286,6 +5269,12 @@ func startWebDashboard() {
 			}
 			if req.BlockAds != nil {
 				st.Geo.BlockAds = req.BlockAds
+			}
+			if s := strings.TrimSpace(req.DomainStrategy); s != "" {
+				st.Geo.DomainStrategy = s
+			}
+			if s := strings.TrimSpace(req.DomainMatcher); s != "" {
+				st.Geo.DomainMatcher = s
 			}
 			if req.DirectDomains != nil {
 				st.Geo.DirectDomains = sanitizeStringList(req.DirectDomains)
@@ -3311,9 +5300,15 @@ func startWebDashboard() {
 			if strings.TrimSpace(req.GeoSiteURL) != "" {
 				st.Geo.GeoSiteURL = strings.TrimSpace(req.GeoSiteURL)
 			}
-			_ = saveState(st)
-			log.Printf("[passwall-droid] updated geo routing rules (bypass_iran=%v bypass_cn=%v block_ads=%v)",
-				st.Geo.IsBypassIran(), st.Geo.IsBypassCN(), st.Geo.IsBlockAds())
+			sanitizePanelState(&st)
+			if err := saveState(st); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			log.Printf("[passwall-droid] updated geo routing rules (bypass_iran=%v bypass_cn=%v block_ads=%v domain_strategy=%s domain_matcher=%s)",
+				st.Geo.IsBypassIran(), st.Geo.IsBypassCN(), st.Geo.IsBlockAds(),
+				st.Geo.EffectiveDomainStrategy(), st.Geo.EffectiveDomainMatcher())
 
 			engineMu.Lock()
 			active := engineActive
@@ -3407,21 +5402,58 @@ func startWebDashboard() {
 			return
 		}
 		st := loadState()
-		var req struct {
-			Action  string `json:"action"` // "import", "select", "delete", "edit", "update"
-			URI     string `json:"uri"`
-			ID      string `json:"id"`
-			Name    string `json:"name"`
-			Address string `json:"address"`
-			Port    int    `json:"port"`
-			SNI     string `json:"sni"`
-		}
+		var req NodeEditRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch req.Action {
+		case "parse_uri":
+			node, err := parseShareURI(req.URI, "manual")
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "node": node})
+			return
+		case "export_uri":
+			var targetNode NodeProfile
+			found := false
+			if req.ID != "" {
+				for _, n := range st.Nodes {
+					if n.ID == req.ID {
+						targetNode = n
+						found = true
+						break
+					}
+				}
+			}
+			if !found && req.Outbound != nil {
+				targetNode = NodeProfile{
+					Name:     req.Name,
+					Protocol: req.Protocol,
+					Address:  req.Address,
+					Port:     req.Port,
+					Outbound: req.Outbound,
+				}
+				syncNodeProfileFromOutbound(&targetNode)
+				found = true
+			}
+			if !found {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "node not found"})
+				return
+			}
+			uri := buildShareURI(targetNode)
+			if uri == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "unable to build share URI for this node"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "uri": uri})
+			return
 		case "import":
 			node, err := parseShareURI(req.URI, "manual")
 			if err != nil {
@@ -3434,6 +5466,64 @@ func startWebDashboard() {
 			_ = saveState(st)
 			log.Printf("[passwall-droid] imported manual node: %s (%s:%d)", node.Name, node.Address, node.Port)
 			_ = restartProxyEngine()
+		case "create", "add":
+			var node NodeProfile
+			if strings.TrimSpace(req.URI) != "" {
+				parsed, err := parseShareURI(req.URI, "manual")
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+				node = parsed
+				if strings.TrimSpace(req.Name) != "" {
+					node.Name = strings.TrimSpace(req.Name)
+				}
+			} else if req.Outbound != nil {
+				node = NodeProfile{
+					ID:       fmt.Sprintf("manual-%d", time.Now().UnixNano()),
+					Name:     strings.TrimSpace(req.Name),
+					Group:    "manual",
+					Protocol: normalizeNodeProtocol(req.Protocol),
+					Address:  strings.TrimSpace(req.Address),
+					Port:     req.Port,
+					Outbound: deepCloneMap(req.Outbound),
+				}
+				node.Outbound["tag"] = "proxy"
+				syncNodeProfileFromOutbound(&node)
+				if node.Address == "" || node.Port <= 0 {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "outbound must include valid server address and port"})
+					return
+				}
+				if node.Name == "" {
+					node.Name = fmt.Sprintf("%s-%s:%d", node.Protocol, node.Address, node.Port)
+				}
+			} else {
+				node = NodeProfile{
+					ID:    fmt.Sprintf("manual-%d", time.Now().UnixNano()),
+					Group: "manual",
+				}
+				if err := applyNodeEditRequest(&node, req); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+			}
+			st.Nodes = append(st.Nodes, node)
+			if req.Activate || st.ActiveNode == "" {
+				st.ActiveNode = node.ID
+			}
+			_ = saveState(st)
+			log.Printf("[passwall-droid] created manual node: %s (%s, %s:%d)", node.Name, node.Protocol, node.Address, node.Port)
+			engineMu.Lock()
+			active := engineActive
+			engineMu.Unlock()
+			if active && st.ActiveNode == node.ID {
+				_ = restartProxyEngine()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "id": node.ID, "node": node})
+			return
 		case "edit", "update":
 			foundIdx := -1
 			for i := range st.Nodes {
@@ -3460,6 +5550,25 @@ func startWebDashboard() {
 					parsed.Name = strings.TrimSpace(req.Name)
 				}
 				st.Nodes[foundIdx] = parsed
+			} else if req.Outbound != nil {
+				obCopy := deepCloneMap(req.Outbound)
+				obCopy["tag"] = "proxy"
+				st.Nodes[foundIdx].Outbound = obCopy
+				if strings.TrimSpace(req.Name) != "" {
+					st.Nodes[foundIdx].Name = strings.TrimSpace(req.Name)
+				}
+				syncNodeProfileFromOutbound(&st.Nodes[foundIdx])
+				if st.Nodes[foundIdx].Address == "" || st.Nodes[foundIdx].Port <= 0 {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": "outbound must include valid server address and port"})
+					return
+				}
+			} else if req.FullEdit || req.Protocol != "" {
+				if err := applyNodeEditRequest(&st.Nodes[foundIdx], req); err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
 			} else {
 				if strings.TrimSpace(req.Name) != "" {
 					st.Nodes[foundIdx].Name = strings.TrimSpace(req.Name)
@@ -3476,7 +5585,12 @@ func startWebDashboard() {
 			_ = saveState(st)
 			log.Printf("[passwall-droid] updated node: %s (%s, %s:%d)", st.Nodes[foundIdx].ID, st.Nodes[foundIdx].Name, st.Nodes[foundIdx].Address, st.Nodes[foundIdx].Port)
 			if st.ActiveNode == req.ID {
-				_ = restartProxyEngine()
+				engineMu.Lock()
+				active := engineActive
+				engineMu.Unlock()
+				if active {
+					_ = restartProxyEngine()
+				}
 			}
 		case "select":
 			st.ActiveNode = req.ID
@@ -3634,6 +5748,12 @@ func startWebDashboard() {
 		_, _ = w.Write([]byte(strings.Join(lines, "\n")))
 	})
 
+	return mux
+}
+
+func startWebDashboard() {
+	mux := buildWebMux()
+
 	ln, err := net.Listen("tcp4", WebListenAddr)
 	if err != nil {
 		log.Printf("[passwall-droid] web dashboard bind warning (%s): %v", WebListenAddr, err)
@@ -3737,13 +5857,49 @@ func main() {
 		}
 		return
 
+	case "backup":
+		data, err := createBackupBundle()
+		if err != nil {
+			fmt.Printf("Backup failed: %v\n", err)
+			os.Exit(1)
+		}
+		if len(os.Args) > 2 && strings.TrimSpace(os.Args[2]) != "" {
+			outPath := strings.TrimSpace(os.Args[2])
+			if err := writeSyncedFile(outPath, data); err != nil {
+				fmt.Printf("Failed writing backup file %s: %v\n", outPath, err)
+				os.Exit(1)
+			}
+			fmt.Printf("Backup saved to %s\n", outPath)
+		} else {
+			fmt.Println(string(data))
+		}
+		return
+
+	case "restore":
+		if len(os.Args) < 3 || strings.TrimSpace(os.Args[2]) == "" {
+			fmt.Printf("Usage: %s restore <backup-file.json>\n", filepath.Base(os.Args[0]))
+			os.Exit(1)
+		}
+		raw, err := os.ReadFile(strings.TrimSpace(os.Args[2]))
+		if err != nil {
+			fmt.Printf("Failed reading backup file: %v\n", err)
+			os.Exit(1)
+		}
+		stRestored, cfgRestored, err := restoreBackupBundle(raw)
+		if err != nil {
+			fmt.Printf("Restore failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Backup restored (%d nodes, config=%v).\n", len(stRestored.Nodes), cfgRestored)
+		return
+
 	case "start":
 		if pid, ok := isRunning(); ok {
 			fmt.Printf("Already running (PID %d)\n", pid)
 			return
 		}
 	default:
-		fmt.Printf("Usage: %s [start|stop|status|reset-config|update-geo]\n", filepath.Base(os.Args[0]))
+		fmt.Printf("Usage: %s [start|stop|status|reset-config|update-geo|backup|restore]\n", filepath.Base(os.Args[0]))
 		os.Exit(1)
 	}
 
@@ -3822,13 +5978,29 @@ textarea{width:100%;background:#0f172a;border:1px solid #334155;border-radius:7p
 pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;font-size:11px;color:#cbd5e1;overflow-x:auto;max-height:320px;white-space:pre-wrap;word-break:break-all}
 .msg{font-size:12px;color:#38bdf8;margin-top:6px;min-height:16px}
 .hidden{display:none !important}
-.modal-bg{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:999;padding:12px}
+.modal-bg{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:999;padding:10px}
 .modal-bg.hidden{display:none !important}
-.modal-card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px;width:100%;max-width:440px;box-sizing:border-box}
+.modal-card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:14px;width:100%;max-width:540px;max-height:92vh;overflow-y:auto;box-sizing:border-box}
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:10px}
 .stat-box{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px}
 .stat-val{font-size:13px;font-weight:700;color:#38bdf8;margin-top:2px}
 .stat-lbl{font-size:11px;color:#94a3b8}
+.switch{position:relative;display:inline-block;width:44px;height:24px;flex:0 0 auto}
+.switch input{opacity:0;width:0;height:0;margin:0}
+.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#334155;border-radius:24px;transition:.2s}
+.slider:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;background:#f8fafc;border-radius:50%;transition:.2s}
+.switch input:checked + .slider{background:#059669}
+.switch input:checked + .slider:before{transform:translateX(20px)}
+.section-box{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:10px;margin-bottom:12px}
+.alert-warn{background:#451a03;border:1px solid #d97706;color:#fde68a;border-radius:7px;padding:8px 10px;font-size:12px;margin-bottom:10px}
+.sub-tabs{display:flex;gap:6px;margin-bottom:10px}
+.sub-tab{flex:1;height:30px;display:inline-flex;align-items:center;justify-content:center;border-radius:7px;background:#0f172a;border:1px solid #334155;font-size:12px;font-weight:600;color:#94a3b8;cursor:pointer}
+.sub-tab.active{background:#2563eb;color:#fff;border-color:#2563eb}
+.field-lbl{font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1}
+.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.chk-inline{display:flex;align-items:center;gap:8px;font-size:12px;color:#cbd5e1;cursor:pointer;margin-bottom:8px}
+.chk-inline input[type=checkbox]{width:18px;height:18px;margin:0}
+input[type=file]{padding:5px 8px;height:auto;line-height:1.3}
 </style>
 </head>
 <body>
@@ -3941,9 +6113,26 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
   <input id="uriInput" type="text" placeholder="vless:// | trojan:// | vmess:// | ss:// | hysteria2:// | hy2://">
   <button class="btn-green" style="width:100%;margin-bottom:12px" onclick="importURI()">Import &amp; Connect</button>
 
+  <div id="vlessInsecureAlert" class="alert-warn hidden">
+    <b>VLESS TLS/Encryption Warning:</b> Your active VLESS node has no TLS, Reality, or VLESS encryption on a public address. Xray rejects this with <i>&quot;vless without TLS or other encryption is prohibited unless the server address is a private IP or domain&quot;</i> unless the switcher below is enabled.
+    <div style="margin-top:6px"><button class="btn-amber btn-sm" type="button" onclick="setAllowInsecureVless(true)">Enable Switcher &amp; Connect</button></div>
+  </div>
+
+  <div class="section-box" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+    <div style="flex:1;min-width:0">
+      <div style="font-size:12px;font-weight:700;color:#f8fafc">Ignore VLESS Without TLS / Encryption Error</div>
+      <div class="node-sub">Bypass Xray&#39;s public unencrypted VLESS restriction via local bridge so plain VLESS nodes work.</div>
+    </div>
+    <label class="switch">
+      <input id="allowInsecureVlessChk" type="checkbox" onchange="toggleAllowInsecureVless(this.checked)">
+      <span class="slider"></span>
+    </label>
+  </div>
+
   <div class="header">
     <div class="title" style="font-size:13px">Saved Nodes</div>
     <div class="row">
+      <button id="btnNewNode" class="btn-blue btn-sm" onclick="openCreateNode()">+ New Node</button>
       <button class="btn-amber btn-sm" onclick="pingAll(false)">Ping All</button>
       <button class="btn-green btn-sm" onclick="pingAll(true)">Fastest</button>
     </div>
@@ -3953,33 +6142,45 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 
 <div id="p-dns" class="card hidden">
   <div class="title" style="font-size:13px;margin-bottom:6px">DNS Configuration</div>
-  <div class="meta" style="margin-bottom:10px">Internal Xray DNS resolver for phone &amp; tethered devices. Direct DNS resolves proxy domains and domestic traffic; Remote DNS handles proxied/blocked sites.</div>
+  <div class="meta" style="margin-bottom:10px">Internal Xray DNS resolver for phone &amp; tethered devices. Direct DNS resolves proxy node domains and domestic traffic; Remote DNS handles proxied/blocked sites.</div>
+
+  <div style="background:#0f172a;border:1px solid #334155;border-radius:7px;padding:10px;margin-bottom:12px">
+    <label style="display:flex;align-items:flex-start;gap:8px;font-size:12px;color:#cbd5e1;cursor:pointer">
+      <input id="dnsRedirectChk" type="checkbox" style="width:18px;height:18px;margin:2px 0 0 0" checked>
+      <span><b>DNS Redirect</b><span class="node-sub" style="display:block">Hijack port 53 DNS requests from phone &amp; tethered devices to Xray internal DNS (and block DoT port 853). Disable to let system/client DNS bypass interception.</span></span>
+    </label>
+  </div>
 
   <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Remote DNS (Proxied / Foreign)</div>
   <input id="dnsRemoteInput" type="text" placeholder="tcp://1.1.1.1">
-  <div class="row" style="margin-bottom:10px;flex-wrap:wrap;gap:4px">
+  <div class="row" style="margin-bottom:8px;flex-wrap:wrap;gap:4px">
     <button class="btn-sm" onclick="setDNSField('dnsRemoteInput','tcp://1.1.1.1')">1.1.1.1 (TCP)</button>
     <button class="btn-sm" onclick="setDNSField('dnsRemoteInput','1.1.1.1')">1.1.1.1 (UDP)</button>
     <button class="btn-sm" onclick="setDNSField('dnsRemoteInput','tcp://8.8.8.8')">8.8.8.8 (TCP)</button>
     <button class="btn-sm" onclick="setDNSField('dnsRemoteInput','https://1.1.1.1/dns-query')">Cloudflare DoH</button>
     <button class="btn-sm" onclick="setDNSField('dnsRemoteInput','https://dns.google/dns-query')">Google DoH</button>
   </div>
+  <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Remote Query Strategy</div>
+  <select id="dnsRemoteStrategySel" style="margin-bottom:12px">
+    <option value="UseIPv4">UseIPv4 (Recommended - IPv4 A records only)</option>
+    <option value="UseIP">UseIP (Both IPv4 and IPv6)</option>
+    <option value="UseIPv6">UseIPv6 (IPv6 AAAA records only)</option>
+  </select>
 
   <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Direct DNS (Domestic / Node Resolution)</div>
   <input id="dnsDirectInput" type="text" placeholder="1.1.1.1">
-  <div class="row" style="margin-bottom:10px;flex-wrap:wrap;gap:4px">
+  <div class="row" style="margin-bottom:8px;flex-wrap:wrap;gap:4px">
     <button class="btn-sm" onclick="setDNSField('dnsDirectInput','1.1.1.1')">1.1.1.1 (Cloudflare UDP)</button>
     <button class="btn-sm" onclick="setDNSField('dnsDirectInput','localhost')">localhost (System DNS)</button>
     <button class="btn-sm" onclick="setDNSField('dnsDirectInput','10.202.10.202')">Shecan (10.202.10.202)</button>
     <button class="btn-sm" onclick="setDNSField('dnsDirectInput','77.88.8.8')">Yandex (77.88.8.8)</button>
     <button class="btn-sm" onclick="setDNSField('dnsDirectInput','223.5.5.5')">AliDNS (223.5.5.5)</button>
   </div>
-
-  <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Query Strategy</div>
-  <select id="dnsStrategySel" style="margin-bottom:12px">
+  <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Direct Query Strategy</div>
+  <select id="dnsDirectStrategySel" style="margin-bottom:12px">
     <option value="UseIPv4">UseIPv4 (Recommended - Prevents IPv6 timeouts)</option>
     <option value="UseIP">UseIP (Both IPv4 and IPv6)</option>
-    <option value="UseIPv6">UseIPv6 (IPv6 Preferred)</option>
+    <option value="UseIPv6">UseIPv6 (IPv6 AAAA records only)</option>
   </select>
 
   <button class="btn-green" style="width:100%" onclick="saveDNS()">Save &amp; Apply DNS</button>
@@ -3987,7 +6188,29 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 
 <div id="p-geo" class="card hidden">
   <div class="title" style="font-size:13px;margin-bottom:6px">Geo Routing &amp; Rules Settings</div>
-  <div class="meta" style="margin-bottom:10px">Manage Geosite/GeoIP rule policies for Rule Mode. Bypass domestic services, block ads and trackers, configure custom routing domains and IP lists, and update Geo databases.</div>
+  <div class="meta" style="margin-bottom:10px">Configure Xray Domain Strategy &amp; Matcher, Geosite/GeoIP rule policies for Rule Mode, custom routing lists, and Geo database updates.</div>
+
+  <div style="background:#0f172a;border:1px solid #334155;border-radius:7px;padding:10px;margin-bottom:12px">
+    <div style="font-size:12px;font-weight:700;color:#f8fafc;margin-bottom:8px">Routing Strategy &amp; Matcher</div>
+    <div class="field-grid">
+      <div>
+        <div class="field-lbl">Domain Strategy</div>
+        <select id="geoDomainStrategySel">
+          <option value="AsIs">AsIs (Route by domain/sniffing only)</option>
+          <option value="IPIfNonMatch">IPIfNonMatch (Resolve IP if no domain rule matches)</option>
+          <option value="IPOnDemand">IPOnDemand (Resolve IP before matching IP rules)</option>
+        </select>
+      </div>
+      <div>
+        <div class="field-lbl">Domain matcher</div>
+        <select id="geoDomainMatcherSel">
+          <option value="hybrid">hybrid (Balanced MPH + Trie)</option>
+          <option value="linear">linear (Lower RAM linear scan)</option>
+        </select>
+      </div>
+    </div>
+    <div class="node-sub" style="margin-top:2px">Matches OpenWrt Passwall 2 Xray routing options: controls <code>routing.domainStrategy</code> and <code>routing.domainMatcher</code>.</div>
+  </div>
 
   <div style="background:#0f172a;border:1px solid #334155;border-radius:7px;padding:10px;margin-bottom:12px">
     <div style="font-size:12px;font-weight:700;color:#f8fafc;margin-bottom:8px">Built-in Rule Policies (Rule Mode)</div>
@@ -4077,6 +6300,24 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 </div>
 
 <div id="p-config" class="card hidden">
+  <div class="section-box">
+    <div class="title" style="font-size:13px;margin-bottom:4px">Backup &amp; Restore</div>
+    <div class="meta" style="margin-bottom:8px">Export or restore all Passwall settings (nodes, subscriptions, DNS, geo rules, split tunneling, VLESS switcher, and base config.json).</div>
+    <div class="row" style="margin-bottom:8px">
+      <button id="btnDownloadBackup" class="btn-blue" onclick="downloadBackup()">Download Backup (.json)</button>
+      <button id="btnViewBackup" onclick="viewBackupJSON()">View / Copy JSON</button>
+    </div>
+    <div class="field-lbl">Restore from Backup File (.json)</div>
+    <input id="restoreFileInput" type="file" accept=".json,application/json">
+    <div class="row" style="margin-bottom:8px">
+      <button id="btnRestoreBackup" class="btn-amber" onclick="restoreBackup()">Restore Backup</button>
+      <button class="btn-sm" onclick="toggleBackupPaste()">Paste / Edit Backup JSON</button>
+    </div>
+    <div id="backupJsonWrap" class="hidden">
+      <textarea id="backupJsonBox" style="min-height:140px" placeholder="Backup JSON content will appear here when viewing, or paste backup JSON here to restore..."></textarea>
+    </div>
+  </div>
+
   <div class="title" style="font-size:13px;margin-bottom:6px">Base Xray Config (config.json)</div>
   <textarea id="cfgEditor"></textarea>
   <div class="row">
@@ -4100,22 +6341,302 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 <div id="nodeEditModal" class="modal-bg hidden" style="display:none" onclick="if(event.target===this)closeEditNode()">
   <div class="modal-card">
     <div class="header" style="margin-bottom:10px">
-      <div class="title" style="font-size:14px">Edit Proxy Node</div>
+      <div id="editModalTitle" class="title" style="font-size:14px">Edit Proxy Node</div>
       <button class="btn-sm" type="button" onclick="closeEditNode()">✕</button>
     </div>
     <input type="hidden" id="editNodeId">
-    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Node Name</div>
-    <input id="editNodeName" type="text" placeholder="Node Alias">
-    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Server Address</div>
-    <input id="editNodeAddress" type="text" placeholder="example.com or 1.2.3.4">
-    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">Port</div>
-    <input id="editNodePort" type="number" min="1" max="65535" placeholder="443">
-    <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:#cbd5e1">TLS / Reality SNI (Optional)</div>
-    <input id="editNodeSNI" type="text" placeholder="serverName / SNI (optional)">
-    <div style="font-size:12px;font-weight:600;margin:6px 0 4px;color:#cbd5e1">Replace from Share URI (Optional)</div>
-    <input id="editNodeURI" type="text" placeholder="vless://... or trojan://... (optional)">
+    <input type="hidden" id="editNodeIsNew" value="0">
+
+    <div class="sub-tabs">
+      <div id="editTab-visual" class="sub-tab active" onclick="setEditTab('visual')">Visual Editor</div>
+      <div id="editTab-json" class="sub-tab" onclick="setEditTab('json')">Raw Outbound JSON</div>
+      <div id="editTab-uri" class="sub-tab" onclick="setEditTab('uri')">Share URI</div>
+    </div>
+
+    <div id="editModalErr" class="alert-warn hidden" style="margin-bottom:8px"></div>
+
+    <div id="editPaneVisual">
+      <div class="field-grid">
+        <div>
+          <div class="field-lbl">Node Name</div>
+          <input id="editNodeName" type="text" placeholder="Node Alias">
+        </div>
+        <div>
+          <div class="field-lbl">Protocol</div>
+          <select id="editNodeProtocol" onchange="onEditProtocolChange()">
+            <option value="vless">VLESS</option>
+            <option value="vmess">VMess</option>
+            <option value="trojan">Trojan</option>
+            <option value="shadowsocks">Shadowsocks</option>
+            <option value="hysteria2">Hysteria2</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field-grid">
+        <div>
+          <div class="field-lbl">Server Address</div>
+          <input id="editNodeAddress" type="text" placeholder="example.com or 1.2.3.4">
+        </div>
+        <div>
+          <div class="field-lbl">Port</div>
+          <input id="editNodePort" type="number" min="1" max="65535" placeholder="443">
+        </div>
+      </div>
+
+      <div id="editSecAuth" class="section-box" style="margin-bottom:8px">
+        <div style="font-size:12px;font-weight:700;color:#38bdf8;margin-bottom:6px">Authentication</div>
+        <div id="editAuthUUIDRow">
+          <div class="field-lbl">UUID / User ID</div>
+          <input id="editNodeUUID" type="text" placeholder="00000000-0000-0000-0000-000000000000">
+        </div>
+        <div id="editAuthVlessRow" class="field-grid">
+          <div>
+            <div class="field-lbl">Flow (XTLS)</div>
+            <select id="editNodeFlow">
+              <option value="">None</option>
+              <option value="xtls-rprx-vision">xtls-rprx-vision</option>
+              <option value="xtls-rprx-vision-udp443">xtls-rprx-vision-udp443</option>
+            </select>
+          </div>
+          <div>
+            <div class="field-lbl">VLESS Encryption</div>
+            <input id="editNodeVlessEncryption" type="text" placeholder="none">
+          </div>
+        </div>
+        <div id="editAuthVmessRow" class="field-grid hidden">
+          <div>
+            <div class="field-lbl">Alter ID</div>
+            <input id="editNodeAlterId" type="number" min="0" value="0">
+          </div>
+          <div>
+            <div class="field-lbl">VMess Security</div>
+            <select id="editNodeVmessSecurity">
+              <option value="auto">auto</option>
+              <option value="aes-128-gcm">aes-128-gcm</option>
+              <option value="chacha20-poly1305">chacha20-poly1305</option>
+              <option value="none">none</option>
+              <option value="zero">zero</option>
+            </select>
+          </div>
+        </div>
+        <div id="editAuthSSMethodRow" class="hidden">
+          <div class="field-lbl">Encryption Method</div>
+          <select id="editNodeSSMethod">
+            <option value="aes-256-gcm">aes-256-gcm</option>
+            <option value="aes-128-gcm">aes-128-gcm</option>
+            <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305</option>
+            <option value="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm</option>
+            <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm</option>
+            <option value="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305</option>
+            <option value="none">none</option>
+          </select>
+        </div>
+        <div id="editAuthPasswordRow" class="hidden">
+          <div class="field-lbl" id="editPasswordLbl">Password</div>
+          <input id="editNodePassword" type="text" placeholder="Password / Auth secret">
+        </div>
+        <div id="editAuthHyRow" class="hidden">
+          <div class="field-grid">
+            <div>
+              <div class="field-lbl">Up Bandwidth</div>
+              <input id="editNodeHyUp" type="text" placeholder="e.g. 50 mbps">
+            </div>
+            <div>
+              <div class="field-lbl">Down Bandwidth</div>
+              <input id="editNodeHyDown" type="text" placeholder="e.g. 100 mbps">
+            </div>
+          </div>
+          <div class="field-grid">
+            <div>
+              <div class="field-lbl">Obfs Type</div>
+              <select id="editNodeHyObfsType">
+                <option value="">None</option>
+                <option value="salamander">salamander</option>
+              </select>
+            </div>
+            <div>
+              <div class="field-lbl">Obfs Password</div>
+              <input id="editNodeHyObfsPass" type="text" placeholder="Optional obfs password">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="editSecTransport" class="section-box" style="margin-bottom:8px">
+        <div style="font-size:12px;font-weight:700;color:#38bdf8;margin-bottom:6px">Transport</div>
+        <div class="field-lbl">Network</div>
+        <select id="editNodeNetwork" onchange="onEditNetworkChange()">
+          <option value="tcp">TCP / RAW</option>
+          <option value="ws">WebSocket (ws)</option>
+          <option value="xhttp">XHTTP / SplitHTTP</option>
+          <option value="httpupgrade">HTTPUpgrade</option>
+          <option value="grpc">gRPC</option>
+          <option value="kcp">mKCP</option>
+        </select>
+
+        <div id="editTransTcp" class="hidden">
+          <div class="field-lbl">TCP Header Type</div>
+          <select id="editNodeTcpHeaderType" onchange="onEditNetworkChange()">
+            <option value="none">None</option>
+            <option value="http">HTTP</option>
+          </select>
+        </div>
+        <div id="editTransHostPath" class="field-grid hidden">
+          <div>
+            <div class="field-lbl">Host Header</div>
+            <input id="editNodeHost" type="text" placeholder="example.com">
+          </div>
+          <div>
+            <div class="field-lbl">Path</div>
+            <input id="editNodePath" type="text" placeholder="/">
+          </div>
+        </div>
+        <div id="editTransXhttp" class="hidden">
+          <div class="field-lbl">XHTTP Mode</div>
+          <select id="editNodeXhttpMode">
+            <option value="">auto (default)</option>
+            <option value="auto">auto</option>
+            <option value="packet-up">packet-up</option>
+            <option value="stream-up">stream-up</option>
+            <option value="stream-one">stream-one</option>
+          </select>
+        </div>
+        <div id="editTransGrpc" class="hidden">
+          <div class="field-grid">
+            <div>
+              <div class="field-lbl">Service Name</div>
+              <input id="editNodeGrpcService" type="text" placeholder="grpcService">
+            </div>
+            <div>
+              <div class="field-lbl">Authority</div>
+              <input id="editNodeGrpcAuthority" type="text" placeholder="Optional authority">
+            </div>
+          </div>
+          <label class="chk-inline"><input id="editNodeGrpcMulti" type="checkbox"> <span>gRPC Multi Mode</span></label>
+        </div>
+        <div id="editTransKcp" class="field-grid hidden">
+          <div>
+            <div class="field-lbl">KCP Header Type</div>
+            <select id="editNodeKcpHeader">
+              <option value="none">none</option>
+              <option value="srtp">srtp</option>
+              <option value="utp">utp</option>
+              <option value="wechat-video">wechat-video</option>
+              <option value="dtls">dtls</option>
+              <option value="wireguard">wireguard</option>
+              <option value="dns">dns</option>
+            </select>
+          </div>
+          <div>
+            <div class="field-lbl">KCP Seed</div>
+            <input id="editNodeKcpSeed" type="text" placeholder="Optional seed">
+          </div>
+        </div>
+        <div style="margin-top:6px">
+          <div class="field-lbl">Outbound Domain Strategy (sockopt)</div>
+          <select id="editNodeDomainStrategy">
+            <option value="">Auto (Default)</option>
+            <option value="AsIs">AsIs</option>
+            <option value="UseIP">UseIP (IPv4 &amp; IPv6)</option>
+            <option value="UseIPv4">UseIPv4</option>
+            <option value="UseIPv6">UseIPv6</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="editSecSecurity" class="section-box" style="margin-bottom:8px">
+        <div style="font-size:12px;font-weight:700;color:#38bdf8;margin-bottom:6px">Stream Security</div>
+        <div id="editSecTypeRow">
+          <div class="field-lbl">Security Layer</div>
+          <select id="editNodeSecurity" onchange="onEditSecurityChange()">
+            <option value="none">None (Plain)</option>
+            <option value="tls">TLS</option>
+            <option value="reality">REALITY</option>
+          </select>
+        </div>
+
+        <div id="editSecFields" class="hidden">
+          <div class="field-grid">
+            <div>
+              <div class="field-lbl">SNI / Server Name</div>
+              <input id="editNodeSNI" type="text" placeholder="serverName / SNI">
+            </div>
+            <div>
+              <div class="field-lbl">uTLS Fingerprint</div>
+              <select id="editNodeFP">
+                <option value="">Default</option>
+                <option value="chrome">chrome</option>
+                <option value="firefox">firefox</option>
+                <option value="safari">safari</option>
+                <option value="ios">ios</option>
+                <option value="android">android</option>
+                <option value="edge">edge</option>
+                <option value="360">360</option>
+                <option value="qq">qq</option>
+                <option value="random">random</option>
+                <option value="randomized">randomized</option>
+              </select>
+            </div>
+          </div>
+
+          <div id="editSecTlsOnly" class="hidden">
+            <div class="field-grid">
+              <div>
+                <div class="field-lbl">ALPN (comma-separated)</div>
+                <input id="editNodeALPN" type="text" placeholder="h2,http/1.1 or h3">
+              </div>
+              <div>
+                <div class="field-lbl">Pinned Cert SHA256</div>
+                <input id="editNodePinnedSha256" type="text" placeholder="Optional SHA256">
+              </div>
+            </div>
+            <label class="chk-inline"><input id="editNodeAllowInsecure" type="checkbox"> <span>Allow Insecure TLS (skip certificate verification)</span></label>
+          </div>
+
+          <div id="editSecRealityOnly" class="hidden">
+            <div class="field-lbl">Reality Public Key (pbk)</div>
+            <input id="editNodeRealityPBK" type="text" placeholder="Public Key">
+            <div class="field-grid">
+              <div>
+                <div class="field-lbl">Short ID (sid)</div>
+                <input id="editNodeRealitySID" type="text" placeholder="Optional shortId">
+              </div>
+              <div>
+                <div class="field-lbl">SpiderX (spx)</div>
+                <input id="editNodeRealitySPX" type="text" placeholder="/">
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="editPaneJson" class="hidden">
+      <div class="field-lbl">Raw Xray Outbound JSON</div>
+      <textarea id="editNodeRawJSON" style="min-height:260px"></textarea>
+      <div class="row" style="margin-bottom:8px">
+        <button class="btn-sm" type="button" onclick="formatEditRawJSON()">Format JSON</button>
+      </div>
+    </div>
+
+    <div id="editPaneUri" class="hidden">
+      <div class="field-lbl">Import / Replace from Share URI</div>
+      <input id="editNodeURI" type="text" placeholder="vless://... | trojan://... | vmess://... | ss://... | hy2://...">
+      <div class="row" style="margin-bottom:12px">
+        <button class="btn-blue btn-sm" type="button" onclick="loadEditURIIntoForm()">Parse URI into Editor</button>
+      </div>
+      <div class="field-lbl">Export Share URI</div>
+      <input id="editNodeExportURI" type="text" readonly placeholder="Click Generate URI below">
+      <div class="row" style="margin-bottom:8px">
+        <button class="btn-sm" type="button" onclick="generateExportURI()">Generate URI</button>
+        <button class="btn-blue btn-sm" type="button" onclick="copyExportURI()">Copy URI</button>
+      </div>
+    </div>
+
     <div class="row" style="margin-top:10px">
-      <button class="btn-green" style="flex:1" type="button" onclick="saveEditNode()">Save Changes</button>
+      <button id="btnSaveEditNode" class="btn-green" style="flex:2" type="button" onclick="saveEditNode()">Save Changes</button>
+      <button id="btnDuplicateNode" class="btn-blue" style="flex:1" type="button" onclick="duplicateEditNode()">Duplicate</button>
       <button style="flex:1" type="button" onclick="closeEditNode()">Cancel</button>
     </div>
   </div>
@@ -4123,11 +6644,14 @@ pre{background:#090d16;border:1px solid #1e293b;border-radius:7px;padding:10px;f
 
 <script>
 var cachedApps = [];
+var cachedNodes = [];
 var selectedUIDMap = {};
 var subInitialized = false;
 var dnsInitialized = false;
 var checkingConn = false;
 var connCheckedOnce = false;
+var currentEditTab = "visual";
+var editingBaseOutbound = null;
 
 function req(method, url, body, cb) {
   var xhr = new XMLHttpRequest();
@@ -4165,13 +6689,21 @@ function setDNSField(id, val) {
   document.getElementById(id).value = val;
 }
 
+function applyDNSUI(d) {
+  if (!d) return;
+  document.getElementById("dnsRemoteInput").value = d.remote_dns || "tcp://1.1.1.1";
+  document.getElementById("dnsDirectInput").value = d.direct_dns || "1.1.1.1";
+  var fallbackQS = d.query_strategy || "UseIPv4";
+  document.getElementById("dnsRemoteStrategySel").value = d.remote_query_strategy || fallbackQS;
+  document.getElementById("dnsDirectStrategySel").value = d.direct_query_strategy || fallbackQS;
+  document.getElementById("dnsRedirectChk").checked = (d.dns_redirect !== false);
+}
+
 function loadDNS() {
   req("GET", "/api/dns", null, function(code, text) {
     if (code !== 200) { return; }
     var d = JSON.parse(text);
-    document.getElementById("dnsRemoteInput").value = d.remote_dns || "tcp://1.1.1.1";
-    document.getElementById("dnsDirectInput").value = d.direct_dns || "1.1.1.1";
-    document.getElementById("dnsStrategySel").value = d.query_strategy || "UseIPv4";
+    applyDNSUI(d);
     dnsInitialized = true;
   });
 }
@@ -4179,14 +6711,25 @@ function loadDNS() {
 function saveDNS() {
   var r = document.getElementById("dnsRemoteInput").value;
   var d = document.getElementById("dnsDirectInput").value;
-  var s = document.getElementById("dnsStrategySel").value;
+  var rs = document.getElementById("dnsRemoteStrategySel").value;
+  var ds = document.getElementById("dnsDirectStrategySel").value;
+  var rd = document.getElementById("dnsRedirectChk").checked;
+  var combined = (rs === ds) ? rs : "UseIP";
   showMsg("Applying DNS settings and reloading engine...");
-  req("POST", "/api/dns", {remote_dns: r, direct_dns: d, query_strategy: s}, function(code, text) {
+  req("POST", "/api/dns", {
+    remote_dns: r,
+    direct_dns: d,
+    query_strategy: combined,
+    remote_query_strategy: rs,
+    direct_query_strategy: ds,
+    dns_redirect: rd
+  }, function(code, text) {
     if (code === 200) {
       showMsg("DNS updated and proxy engine restarted.");
       refreshStatus();
     } else {
-      var err = JSON.parse(text);
+      var err = {};
+      try { err = JSON.parse(text); } catch(e){}
       showMsg("DNS error: " + (err.error || text));
     }
   });
@@ -4196,6 +6739,8 @@ function loadGeo() {
   req("GET", "/api/geo", null, function(code, text) {
     if (code !== 200) { return; }
     var d = JSON.parse(text);
+    document.getElementById("geoDomainStrategySel").value = d.domain_strategy || "IPIfNonMatch";
+    document.getElementById("geoDomainMatcherSel").value = d.domain_matcher || "hybrid";
     document.getElementById("geoBypassIranChk").checked = (d.bypass_iran !== false);
     document.getElementById("geoBypassCNChk").checked = (d.bypass_cn !== false);
     document.getElementById("geoBlockAdsChk").checked = (d.block_ads !== false);
@@ -4247,6 +6792,8 @@ function parseLines(id) {
 
 function saveGeo() {
   var body = {
+    domain_strategy: document.getElementById("geoDomainStrategySel").value,
+    domain_matcher: document.getElementById("geoDomainMatcherSel").value,
     bypass_iran: document.getElementById("geoBypassIranChk").checked,
     bypass_cn: document.getElementById("geoBypassCNChk").checked,
     block_ads: document.getElementById("geoBlockAdsChk").checked,
@@ -4356,6 +6903,27 @@ function toggleLocalhostProxy(checked) {
   });
 }
 
+function toggleAllowInsecureVless(checked) {
+  showMsg((checked ? "Enabling" : "Disabling") + " VLESS without TLS/encryption bypass...");
+  req("POST", "/api/vless_insecure", {allow_insecure_vless: !!checked}, function(code, text) {
+    if (code === 200) {
+      showMsg("VLESS without TLS/encryption bypass " + (checked ? "enabled." : "disabled."));
+      refreshStatus();
+    } else {
+      var err = text;
+      try { err = JSON.parse(text).error || text; } catch(e){}
+      showMsg("Error updating VLESS switcher: " + err);
+      refreshStatus();
+    }
+  });
+}
+
+function setAllowInsecureVless(val) {
+  var el = document.getElementById("allowInsecureVlessChk");
+  if (el) { el.checked = !!val; }
+  toggleAllowInsecureVless(!!val);
+}
+
 function refreshStatus() {
   req("GET", "/api/status", null, function(code, text) {
     if (code !== 200) { return; }
@@ -4423,6 +6991,15 @@ function refreshStatus() {
       chk.checked = (d.localhost_proxy !== false);
     }
 
+    var vlessChk = document.getElementById("allowInsecureVlessChk");
+    if (vlessChk) {
+      vlessChk.checked = !!d.allow_insecure_vless;
+    }
+    var vlessAlert = document.getElementById("vlessInsecureAlert");
+    if (vlessAlert) {
+      vlessAlert.className = (d.vless_insecure_needed && !d.allow_insecure_vless) ? "alert-warn" : "alert-warn hidden";
+    }
+
     if (d.running && !connCheckedOnce) {
       connCheckedOnce = true;
       checkConn();
@@ -4445,9 +7022,7 @@ function refreshStatus() {
       subInitialized = true;
     }
     if (!dnsInitialized && d.dns) {
-      document.getElementById("dnsRemoteInput").value = d.dns.remote_dns || "tcp://1.1.1.1";
-      document.getElementById("dnsDirectInput").value = d.dns.direct_dns || "1.1.1.1";
-      document.getElementById("dnsStrategySel").value = d.dns.query_strategy || "UseIPv4";
+      applyDNSUI(d.dns);
       dnsInitialized = true;
     }
     document.getElementById("subMeta").innerHTML =
@@ -4482,10 +7057,10 @@ function renderNodes(nodes, activeId) {
       '<div class="node-info"><b>' + esc(n.name) + '</b><div class="node-sub">' +
       esc(n.protocol.toUpperCase()) + ' (' + esc(n.group || 'manual') + ') - ' + esc(n.address) + ':' + n.port + '</div></div>' +
       '<div class="row">' + latHtml +
-      '<button class="btn-sm" onclick="pingOne(\'' + n.id + '\')">Ping</button>' +
-      '<button class="btn-blue btn-sm" onclick="openEditNode(\'' + esc(n.id) + '\')">Edit</button>' +
-      (sel ? '' : '<button class="btn-blue btn-sm" onclick="nodeAct(\'select\',\'' + n.id + '\')">Use</button>') +
-      '<button class="btn-red btn-sm" onclick="nodeAct(\'delete\',\'' + n.id + '\')">X</button>' +
+      '<button class="btn-sm" onclick="pingOne(\'' + escAttr(n.id) + '\')">Ping</button>' +
+      '<button class="btn-blue btn-sm" onclick="openEditNode(\'' + escAttr(n.id) + '\')">Edit</button>' +
+      (sel ? '' : '<button class="btn-blue btn-sm" onclick="nodeAct(\'select\',\'' + escAttr(n.id) + '\')">Use</button>') +
+      '<button class="btn-red btn-sm" onclick="nodeAct(\'delete\',\'' + escAttr(n.id) + '\')">X</button>' +
       '</div></div>';
   }
   box.innerHTML = html;
@@ -4493,6 +7068,10 @@ function renderNodes(nodes, activeId) {
 
 function esc(s) {
   return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function escAttr(s) {
+  return String(s).replace(/\\/g,"\\\\").replace(/'/g,"\\'").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
 
 function ctrl(action) {
@@ -4647,6 +7226,85 @@ function resetConfig() {
   });
 }
 
+function downloadBackup() {
+  window.location.href = "/api/backup?download=1";
+}
+
+function viewBackupJSON() {
+  var wrap = document.getElementById("backupJsonWrap");
+  if (wrap) { wrap.className = ""; }
+  showMsg("Generating backup JSON...");
+  req("GET", "/api/backup", null, function(code, text) {
+    if (code === 200) {
+      var box = document.getElementById("backupJsonBox");
+      if (box) {
+        box.value = text;
+        box.select();
+        try { document.execCommand("copy"); } catch(e){}
+      }
+      showMsg("Backup JSON loaded (ready to copy or restore).");
+    } else {
+      showMsg("Backup error: " + text);
+    }
+  });
+}
+
+function toggleBackupPaste() {
+  var wrap = document.getElementById("backupJsonWrap");
+  if (!wrap) return;
+  wrap.className = (wrap.className === "hidden") ? "" : "hidden";
+}
+
+function sendRestorePayload(rawText) {
+  if (!confirm("Restore backup? Current nodes, settings, and base config.json will be replaced.")) return;
+  showMsg("Restoring backup...");
+  var xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/restore", true);
+  xhr.setRequestHeader("Content-Type", "application/json");
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState === 4) {
+      if (xhr.status === 200) {
+        var res = {};
+        try { res = JSON.parse(xhr.responseText); } catch(e){}
+        subInitialized = false;
+        dnsInitialized = false;
+        var fi = document.getElementById("restoreFileInput");
+        if (fi) { fi.value = ""; }
+        showMsg("Backup restored (" + (res.nodes || 0) + " nodes).");
+        loadConfig();
+        refreshStatus();
+      } else {
+        var err = xhr.responseText;
+        try { err = JSON.parse(xhr.responseText).error || xhr.responseText; } catch(e){}
+        showMsg("Restore failed: " + err);
+      }
+    }
+  };
+  xhr.send(rawText);
+}
+
+function restoreBackup() {
+  var fi = document.getElementById("restoreFileInput");
+  if (fi && fi.files && fi.files.length > 0) {
+    var reader = new FileReader();
+    reader.onload = function(ev) {
+      sendRestorePayload(ev.target.result || "");
+    };
+    reader.onerror = function() {
+      showMsg("Failed to read selected backup file.");
+    };
+    reader.readAsText(fi.files[0]);
+    return;
+  }
+  var box = document.getElementById("backupJsonBox");
+  var raw = box ? box.value : "";
+  if (raw && raw.trim()) {
+    sendRestorePayload(raw);
+    return;
+  }
+  showMsg("Choose a backup .json file or paste backup JSON first.");
+}
+
 function loadLogs() {
   req("GET", "/api/logs", null, function(code, text) {
     if (code === 200) {
@@ -4665,28 +7323,546 @@ function downloadLogs() {
   window.location.href = "/api/logs?download=1";
 }
 
+function showEditModalErr(msg) {
+  var el = document.getElementById("editModalErr");
+  if (!el) return;
+  if (!msg) {
+    el.innerHTML = "";
+    el.className = "alert-warn hidden";
+  } else {
+    el.innerHTML = esc(msg);
+    el.className = "alert-warn";
+  }
+}
+
+function setSelectOrAdd(id, val, fallback) {
+  var sel = document.getElementById(id);
+  if (!sel) return;
+  var v = (val !== undefined && val !== null) ? String(val) : "";
+  if (!v && fallback !== undefined) { v = String(fallback); }
+  var found = false;
+  for (var i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === v) { found = true; break; }
+  }
+  if (!found && v) {
+    var opt = document.createElement("option");
+    opt.value = v;
+    opt.text = v;
+    sel.appendChild(opt);
+  }
+  sel.value = v;
+}
+
+function normProtoUI(p) {
+  var s = String(p || "vless").toLowerCase();
+  if (s === "hysteria" || s === "hy2") return "hysteria2";
+  if (s === "ss") return "shadowsocks";
+  return s;
+}
+
+function normNetUI(n) {
+  var s = String(n || "tcp").toLowerCase();
+  if (s === "splithttp") return "xhttp";
+  if (s === "raw") return "tcp";
+  if (s === "websocket") return "ws";
+  return s;
+}
+
+function onEditProtocolChange() {
+  var proto = document.getElementById("editNodeProtocol").value;
+  var isVless = (proto === "vless");
+  var isVmess = (proto === "vmess");
+  var isTrojan = (proto === "trojan");
+  var isSS = (proto === "shadowsocks");
+  var isHy = (proto === "hysteria2");
+
+  document.getElementById("editAuthUUIDRow").className = (isVless || isVmess) ? "" : "hidden";
+  document.getElementById("editAuthVlessRow").className = isVless ? "field-grid" : "field-grid hidden";
+  document.getElementById("editAuthVmessRow").className = isVmess ? "field-grid" : "field-grid hidden";
+  document.getElementById("editAuthSSMethodRow").className = isSS ? "" : "hidden";
+  document.getElementById("editAuthPasswordRow").className = (isTrojan || isSS || isHy) ? "" : "hidden";
+  document.getElementById("editAuthHyRow").className = isHy ? "" : "hidden";
+  document.getElementById("editPasswordLbl").innerHTML = isHy ? "Auth Password / Secret" : "Password";
+
+  document.getElementById("editSecTransport").className = isHy ? "section-box hidden" : "section-box";
+  document.getElementById("editSecTypeRow").className = isHy ? "hidden" : "";
+  if (isHy) {
+    document.getElementById("editNodeSecurity").value = "tls";
+  }
+  onEditNetworkChange();
+  onEditSecurityChange();
+}
+
+function onEditNetworkChange() {
+  var proto = document.getElementById("editNodeProtocol").value;
+  if (proto === "hysteria2") return;
+  var net = document.getElementById("editNodeNetwork").value;
+  var tcpHdr = document.getElementById("editNodeTcpHeaderType").value;
+
+  document.getElementById("editTransTcp").className = (net === "tcp") ? "" : "hidden";
+  var showHostPath = (net === "ws" || net === "xhttp" || net === "httpupgrade" || (net === "tcp" && tcpHdr === "http"));
+  document.getElementById("editTransHostPath").className = showHostPath ? "field-grid" : "field-grid hidden";
+  document.getElementById("editTransXhttp").className = (net === "xhttp") ? "" : "hidden";
+  document.getElementById("editTransGrpc").className = (net === "grpc") ? "" : "hidden";
+  document.getElementById("editTransKcp").className = (net === "kcp") ? "field-grid" : "field-grid hidden";
+}
+
+function onEditSecurityChange() {
+  var proto = document.getElementById("editNodeProtocol").value;
+  var sec = (proto === "hysteria2") ? "tls" : document.getElementById("editNodeSecurity").value;
+  var hasSec = (sec === "tls" || sec === "reality");
+  document.getElementById("editSecFields").className = hasSec ? "" : "hidden";
+  document.getElementById("editSecTlsOnly").className = (sec === "tls") ? "" : "hidden";
+  document.getElementById("editSecRealityOnly").className = (sec === "reality") ? "" : "hidden";
+}
+
+function cloneJsonObj(o) {
+  if (!o) return {};
+  try { return JSON.parse(JSON.stringify(o)); } catch(e) { return {}; }
+}
+
+function populateEditModalFromNode(node, isNew) {
+  showEditModalErr("");
+  document.getElementById("editNodeIsNew").value = isNew ? "1" : "0";
+  document.getElementById("editNodeId").value = isNew ? "" : (node.id || "");
+  document.getElementById("editModalTitle").innerHTML = isNew ? "Create Proxy Node" : "Edit Proxy Node";
+  document.getElementById("btnSaveEditNode").innerHTML = isNew ? "Create Node" : "Save Changes";
+  document.getElementById("btnDuplicateNode").className = isNew ? "btn-blue hidden" : "btn-blue";
+
+  var ob = cloneJsonObj(node.outbound);
+  editingBaseOutbound = ob;
+
+  var proto = normProtoUI(node.protocol || ob.protocol || "vless");
+  setSelectOrAdd("editNodeProtocol", proto, "vless");
+  document.getElementById("editNodeName").value = node.name || "";
+  document.getElementById("editNodeAddress").value = node.address || "";
+  document.getElementById("editNodePort").value = node.port || (proto === "shadowsocks" ? 8388 : 443);
+  document.getElementById("editNodeURI").value = "";
+  document.getElementById("editNodeExportURI").value = "";
+
+  var stg = ob.settings || {};
+  var vnext0 = (stg.vnext && stg.vnext[0]) ? stg.vnext[0] : null;
+  var user0 = (vnext0 && vnext0.users && vnext0.users[0]) ? vnext0.users[0] : null;
+  var srv0 = (stg.servers && stg.servers[0]) ? stg.servers[0] : null;
+
+  if (!document.getElementById("editNodeAddress").value) {
+    document.getElementById("editNodeAddress").value = (vnext0 && vnext0.address) || (srv0 && srv0.address) || stg.address || "";
+  }
+  if (!node.port) {
+    var p = (vnext0 && vnext0.port) || (srv0 && srv0.port) || stg.port;
+    if (p) document.getElementById("editNodePort").value = p;
+  }
+
+  document.getElementById("editNodeUUID").value = (user0 && user0.id) || stg.id || "";
+  setSelectOrAdd("editNodeFlow", (user0 && user0.flow) || stg.flow || "", "");
+  document.getElementById("editNodeVlessEncryption").value = (user0 && user0.encryption) || stg.encryption || "none";
+  document.getElementById("editNodeAlterId").value = (user0 && typeof user0.alterId === "number") ? user0.alterId : 0;
+  setSelectOrAdd("editNodeVmessSecurity", (user0 && user0.security) || "auto", "auto");
+  setSelectOrAdd("editNodeSSMethod", (srv0 && srv0.method) || "aes-256-gcm", "aes-256-gcm");
+
+  var ss = ob.streamSettings || {};
+  var hySet = ss.hysteriaSettings || {};
+  document.getElementById("editNodePassword").value = (proto === "hysteria2") ? (hySet.auth || "") : ((srv0 && srv0.password) || "");
+  document.getElementById("editNodeHyUp").value = hySet.up || "";
+  document.getElementById("editNodeHyDown").value = hySet.down || "";
+
+  var obfsType = "";
+  var obfsPass = "";
+  if (ss.finalmask && ss.finalmask.udp && ss.finalmask.udp[0]) {
+    obfsType = ss.finalmask.udp[0].type || "";
+    if (ss.finalmask.udp[0].settings) obfsPass = ss.finalmask.udp[0].settings.password || "";
+  }
+  setSelectOrAdd("editNodeHyObfsType", obfsType, "");
+  document.getElementById("editNodeHyObfsPass").value = obfsPass;
+
+  var netType = normNetUI(ss.network || "tcp");
+  if (proto === "hysteria2") netType = "tcp";
+  setSelectOrAdd("editNodeNetwork", netType, "tcp");
+
+  var host = "";
+  var path = "/";
+  var tcpHdr = "none";
+  if (netType === "tcp") {
+    if (ss.tcpSettings && ss.tcpSettings.header && ss.tcpSettings.header.type === "http") {
+      tcpHdr = "http";
+      var reqObj = ss.tcpSettings.header.request || {};
+      if (reqObj.path && reqObj.path.length) path = reqObj.path[0];
+      if (reqObj.headers && reqObj.headers.Host && reqObj.headers.Host.length) host = reqObj.headers.Host[0];
+    }
+  } else if (netType === "ws") {
+    var ws = ss.wsSettings || {};
+    path = ws.path || "/";
+    host = ws.host || (ws.headers && ws.headers.Host) || "";
+  } else if (netType === "xhttp") {
+    var xh = ss.xhttpSettings || ss.splithttpSettings || {};
+    path = xh.path || "/";
+    host = xh.host || "";
+    setSelectOrAdd("editNodeXhttpMode", xh.mode || "", "");
+  } else if (netType === "httpupgrade") {
+    var hu = ss.httpupgradeSettings || {};
+    path = hu.path || "/";
+    host = hu.host || "";
+  } else if (netType === "grpc") {
+    var gs = ss.grpcSettings || {};
+    document.getElementById("editNodeGrpcService").value = gs.serviceName || "";
+    document.getElementById("editNodeGrpcAuthority").value = gs.authority || "";
+    document.getElementById("editNodeGrpcMulti").checked = !!gs.multiMode;
+  } else if (netType === "kcp") {
+    var ks = ss.kcpSettings || {};
+    setSelectOrAdd("editNodeKcpHeader", (ks.header && ks.header.type) || "none", "none");
+    document.getElementById("editNodeKcpSeed").value = ks.seed || "";
+  }
+  setSelectOrAdd("editNodeTcpHeaderType", tcpHdr, "none");
+  document.getElementById("editNodeHost").value = host;
+  document.getElementById("editNodePath").value = path;
+
+  var sec = (ss.security || "none").toLowerCase();
+  if (proto === "hysteria2") sec = "tls";
+  if (sec !== "tls" && sec !== "reality") sec = "none";
+  setSelectOrAdd("editNodeSecurity", sec, "none");
+
+  var sni = "";
+  var fp = "";
+  var alpn = "";
+  var allowInsec = false;
+  var pin = "";
+  var pbk = "";
+  var sid = "";
+  var spx = "";
+
+  if (sec === "tls") {
+    var ts = ss.tlsSettings || {};
+    sni = ts.serverName || "";
+    fp = ts.fingerprint || "";
+    if (ts.alpn && ts.alpn.length) alpn = ts.alpn.join(",");
+    allowInsec = !!ts.allowInsecure;
+    pin = ts.pinnedPeerCertificateSha256 || "";
+  } else if (sec === "reality") {
+    var rs = ss.realitySettings || {};
+    sni = rs.serverName || "";
+    fp = rs.fingerprint || "chrome";
+    pbk = rs.publicKey || "";
+    sid = rs.shortId || "";
+    spx = rs.spiderX || "";
+  }
+
+  document.getElementById("editNodeSNI").value = sni;
+  setSelectOrAdd("editNodeFP", fp, "");
+  document.getElementById("editNodeALPN").value = alpn;
+  document.getElementById("editNodeAllowInsecure").checked = allowInsec;
+  document.getElementById("editNodePinnedSha256").value = pin;
+  document.getElementById("editNodeRealityPBK").value = pbk;
+  document.getElementById("editNodeRealitySID").value = sid;
+  document.getElementById("editNodeRealitySPX").value = spx;
+  var sockopt = ss.sockopt || {};
+  setSelectOrAdd("editNodeDomainStrategy", sockopt.domainStrategy || "", "");
+
+  document.getElementById("editNodeRawJSON").value = JSON.stringify(ob, null, 2);
+  onEditProtocolChange();
+}
+
+function collectEditFormPayload(actionName, targetId) {
+  return {
+    action: actionName,
+    full_edit: true,
+    id: targetId || "",
+    name: document.getElementById("editNodeName").value,
+    protocol: document.getElementById("editNodeProtocol").value,
+    address: document.getElementById("editNodeAddress").value,
+    port: parseInt(document.getElementById("editNodePort").value, 10) || 0,
+    uuid: document.getElementById("editNodeUUID").value,
+    flow: document.getElementById("editNodeFlow").value,
+    encryption: document.getElementById("editNodeVlessEncryption").value,
+    alter_id: parseInt(document.getElementById("editNodeAlterId").value, 10) || 0,
+    vmess_security: document.getElementById("editNodeVmessSecurity").value,
+    password: document.getElementById("editNodePassword").value,
+    ss_method: document.getElementById("editNodeSSMethod").value,
+    network: document.getElementById("editNodeNetwork").value,
+    tcp_header_type: document.getElementById("editNodeTcpHeaderType").value,
+    host: document.getElementById("editNodeHost").value,
+    path: document.getElementById("editNodePath").value,
+    xhttp_mode: document.getElementById("editNodeXhttpMode").value,
+    service_name: document.getElementById("editNodeGrpcService").value,
+    grpc_authority: document.getElementById("editNodeGrpcAuthority").value,
+    grpc_multi_mode: document.getElementById("editNodeGrpcMulti").checked,
+    kcp_header_type: document.getElementById("editNodeKcpHeader").value,
+    kcp_seed: document.getElementById("editNodeKcpSeed").value,
+    security: document.getElementById("editNodeSecurity").value,
+    sni: document.getElementById("editNodeSNI").value,
+    fp: document.getElementById("editNodeFP").value,
+    alpn: document.getElementById("editNodeALPN").value,
+    allow_insecure: document.getElementById("editNodeAllowInsecure").checked,
+    pinned_sha256: document.getElementById("editNodePinnedSha256").value,
+    pbk: document.getElementById("editNodeRealityPBK").value,
+    sid: document.getElementById("editNodeRealitySID").value,
+    spx: document.getElementById("editNodeRealitySPX").value,
+    hy_up: document.getElementById("editNodeHyUp").value,
+    hy_down: document.getElementById("editNodeHyDown").value,
+    obfs_type: document.getElementById("editNodeHyObfsType").value,
+    obfs_password: document.getElementById("editNodeHyObfsPass").value,
+    sockopt_domain_strategy: document.getElementById("editNodeDomainStrategy").value
+  };
+}
+
+function syncVisualToRawJSON() {
+  var p = collectEditFormPayload("edit", "");
+  var ob = cloneJsonObj(editingBaseOutbound);
+  ob.tag = "proxy";
+  ob.protocol = (p.protocol === "hysteria2") ? "hysteria" : p.protocol;
+  if (!ob.settings) ob.settings = {};
+  if (p.protocol === "vless") {
+    var u = {id: p.uuid, encryption: p.encryption || "none"};
+    if (p.flow) u.flow = p.flow;
+    ob.settings = {vnext: [{address: p.address, port: p.port, users: [u]}]};
+  } else if (p.protocol === "vmess") {
+    ob.settings = {vnext: [{address: p.address, port: p.port, users: [{id: p.uuid, alterId: p.alter_id, security: p.vmess_security || "auto"}]}]};
+  } else if (p.protocol === "trojan") {
+    ob.settings = {servers: [{address: p.address, port: p.port, password: p.password}]};
+  } else if (p.protocol === "shadowsocks") {
+    ob.settings = {servers: [{address: p.address, port: p.port, method: p.ss_method || "aes-256-gcm", password: p.password}]};
+  } else if (p.protocol === "hysteria2") {
+    ob.settings = {version: 2, address: p.address, port: p.port};
+  }
+  var origSS = ob.streamSettings || {};
+  var ss = {};
+  if (origSS.sockopt) ss.sockopt = origSS.sockopt;
+  if (p.protocol === "hysteria2") {
+    ss.network = "hysteria";
+    ss.security = "tls";
+    var alpnRaw = p.alpn ? p.alpn.split(",") : ["h3"];
+    var alpnArr = [];
+    for (var i = 0; i < alpnRaw.length; i++) {
+      var trimmedAlpn = alpnRaw[i].trim();
+      if (trimmedAlpn) alpnArr.push(trimmedAlpn);
+    }
+    if (!alpnArr.length) alpnArr = ["h3"];
+    ss.tlsSettings = {serverName: p.sni || p.address, alpn: alpnArr, allowInsecure: !!p.allow_insecure, fingerprint: p.fp || "chrome"};
+    if (p.pinned_sha256) ss.tlsSettings.pinnedPeerCertificateSha256 = p.pinned_sha256;
+    ss.hysteriaSettings = {version: 2, auth: p.password, udpIdleTimeout: 60};
+    if (p.hy_up) ss.hysteriaSettings.up = p.hy_up;
+    if (p.hy_down) ss.hysteriaSettings.down = p.hy_down;
+    if (p.obfs_type && p.obfs_password) {
+      var mObj = [{type: p.obfs_type, settings: {password: p.obfs_password}}];
+      ss.finalmask = {udp: mObj};
+      ss.udpmasks = mObj;
+    }
+    ob.streamSettings = ss;
+  } else if (!(p.protocol === "shadowsocks" && p.network === "tcp" && p.security === "none" && p.tcp_header_type !== "http")) {
+    ss.network = p.network || "tcp";
+    if (ss.network === "tcp" && p.tcp_header_type === "http") {
+      var reqHdr = {version: "1.1", method: "GET", path: [p.path || "/"]};
+      if (p.host) reqHdr.headers = {Host: [p.host]};
+      ss.tcpSettings = {header: {type: "http", request: reqHdr}};
+    } else if (p.network === "ws") {
+      ss.wsSettings = {path: p.path || "/"};
+      if (p.host) { ss.wsSettings.host = p.host; ss.wsSettings.headers = {Host: p.host}; }
+    } else if (p.network === "xhttp") {
+      ss.xhttpSettings = (origSS.xhttpSettings && typeof origSS.xhttpSettings === "object") ? cloneJsonObj(origSS.xhttpSettings) : {};
+      ss.xhttpSettings.path = p.path || "/";
+      if (p.host) { ss.xhttpSettings.host = p.host; } else { delete ss.xhttpSettings.host; }
+      if (p.xhttp_mode) { ss.xhttpSettings.mode = p.xhttp_mode; } else { delete ss.xhttpSettings.mode; }
+    } else if (p.network === "httpupgrade") {
+      ss.httpupgradeSettings = {path: p.path || "/"};
+      if (p.host) ss.httpupgradeSettings.host = p.host;
+    } else if (p.network === "grpc") {
+      ss.grpcSettings = {serviceName: p.service_name || ""};
+      if (p.grpc_multi_mode) ss.grpcSettings.multiMode = true;
+      if (p.grpc_authority) ss.grpcSettings.authority = p.grpc_authority;
+    } else if (p.network === "kcp") {
+      ss.kcpSettings = {};
+      if (p.kcp_header_type && p.kcp_header_type !== "none") ss.kcpSettings.header = {type: p.kcp_header_type};
+      if (p.kcp_seed) ss.kcpSettings.seed = p.kcp_seed;
+    }
+    if (p.security === "tls") {
+      ss.security = "tls";
+      ss.tlsSettings = {};
+      if (p.sni) ss.tlsSettings.serverName = p.sni;
+      if (p.fp) ss.tlsSettings.fingerprint = p.fp;
+      if (p.alpn) {
+        var alRaw = p.alpn.split(",");
+        var al = [];
+        for (var j = 0; j < alRaw.length; j++) {
+          var tAl = alRaw[j].trim();
+          if (tAl) al.push(tAl);
+        }
+        if (al.length) ss.tlsSettings.alpn = al;
+      }
+      if (p.allow_insecure) ss.tlsSettings.allowInsecure = true;
+      if (p.pinned_sha256) ss.tlsSettings.pinnedPeerCertificateSha256 = p.pinned_sha256;
+    } else if (p.security === "reality") {
+      ss.security = "reality";
+      ss.realitySettings = {serverName: p.sni, fingerprint: p.fp || "chrome", publicKey: p.pbk, shortId: p.sid, spiderX: p.spx};
+    }
+    ob.streamSettings = ss;
+  } else {
+    delete ob.streamSettings;
+  }
+  var dsSock = p.sockopt_domain_strategy || "";
+  if (dsSock) {
+    if (!ob.streamSettings || typeof ob.streamSettings !== "object") ob.streamSettings = {};
+    if (!ob.streamSettings.sockopt || typeof ob.streamSettings.sockopt !== "object") ob.streamSettings.sockopt = {};
+    ob.streamSettings.sockopt.domainStrategy = dsSock;
+  } else if (ob.streamSettings && ob.streamSettings.sockopt) {
+    delete ob.streamSettings.sockopt.domainStrategy;
+    var hasSockKeys = false;
+    for (var sk in ob.streamSettings.sockopt) {
+      if (ob.streamSettings.sockopt.hasOwnProperty(sk)) { hasSockKeys = true; break; }
+    }
+    if (!hasSockKeys) delete ob.streamSettings.sockopt;
+    var hasSSKeys = false;
+    for (var ssk in ob.streamSettings) {
+      if (ob.streamSettings.hasOwnProperty(ssk)) { hasSSKeys = true; break; }
+    }
+    if (!hasSSKeys) delete ob.streamSettings;
+  }
+  document.getElementById("editNodeRawJSON").value = JSON.stringify(ob, null, 2);
+}
+
+function setEditTab(tab) {
+  showEditModalErr("");
+  if (currentEditTab === "visual" && tab === "json") {
+    syncVisualToRawJSON();
+  } else if (currentEditTab === "json" && tab === "visual") {
+    try {
+      var parsedOb = JSON.parse(document.getElementById("editNodeRawJSON").value);
+      var tmpNode = {
+        id: document.getElementById("editNodeId").value,
+        name: document.getElementById("editNodeName").value,
+        protocol: normProtoUI(parsedOb.protocol),
+        outbound: parsedOb
+      };
+      populateEditModalFromNode(tmpNode, document.getElementById("editNodeIsNew").value === "1");
+    } catch(e) {
+      showEditModalErr("Invalid Raw Outbound JSON: " + e.message);
+      return;
+    }
+  }
+  currentEditTab = tab;
+  var names = ["visual", "json", "uri"];
+  for (var i = 0; i < names.length; i++) {
+    var k = names[i];
+    var tEl = document.getElementById("editTab-" + k);
+    if (tEl) tEl.className = (k === tab) ? "sub-tab active" : "sub-tab";
+  }
+  document.getElementById("editPaneVisual").className = (tab === "visual") ? "" : "hidden";
+  document.getElementById("editPaneJson").className = (tab === "json") ? "" : "hidden";
+  document.getElementById("editPaneUri").className = (tab === "uri") ? "" : "hidden";
+}
+
+function formatEditRawJSON() {
+  showEditModalErr("");
+  try {
+    var obj = JSON.parse(document.getElementById("editNodeRawJSON").value);
+    document.getElementById("editNodeRawJSON").value = JSON.stringify(obj, null, 2);
+  } catch(e) {
+    showEditModalErr("Invalid JSON: " + e.message);
+  }
+}
+
+function loadEditURIIntoForm() {
+  var uri = document.getElementById("editNodeURI").value;
+  if (!uri || !uri.trim()) {
+    showEditModalErr("Paste a share URI first.");
+    return;
+  }
+  showEditModalErr("");
+  req("POST", "/api/nodes", {action: "parse_uri", uri: uri}, function(code, text) {
+    if (code === 200) {
+      var res = JSON.parse(text);
+      var parsed = res.node;
+      var curId = document.getElementById("editNodeId").value;
+      var isNew = (document.getElementById("editNodeIsNew").value === "1");
+      parsed.id = curId;
+      populateEditModalFromNode(parsed, isNew);
+      setEditTab("visual");
+      showMsg("URI loaded into editor.");
+    } else {
+      var err = text;
+      try { err = JSON.parse(text).error || text; } catch(e){}
+      showEditModalErr("URI parse error: " + err);
+    }
+  });
+}
+
+function generateExportURI() {
+  showEditModalErr("");
+  var id = document.getElementById("editNodeId").value;
+  var payload = {action: "export_uri", id: id};
+  if (currentEditTab === "json") {
+    try {
+      payload.outbound = JSON.parse(document.getElementById("editNodeRawJSON").value);
+      payload.name = document.getElementById("editNodeName").value;
+      payload.protocol = document.getElementById("editNodeProtocol").value;
+      delete payload.id;
+    } catch(e) {
+      showEditModalErr("Invalid JSON: " + e.message);
+      return;
+    }
+  } else if (!id) {
+    syncVisualToRawJSON();
+    try {
+      payload.outbound = JSON.parse(document.getElementById("editNodeRawJSON").value);
+      payload.name = document.getElementById("editNodeName").value;
+      payload.protocol = document.getElementById("editNodeProtocol").value;
+    } catch(e){}
+  }
+  req("POST", "/api/nodes", payload, function(code, text) {
+    if (code === 200) {
+      var res = JSON.parse(text);
+      document.getElementById("editNodeExportURI").value = res.uri || "";
+    } else {
+      var err = text;
+      try { err = JSON.parse(text).error || text; } catch(e){}
+      showEditModalErr("Export URI error: " + err);
+    }
+  });
+}
+
+function copyExportURI() {
+  var inp = document.getElementById("editNodeExportURI");
+  if (!inp || !inp.value) {
+    generateExportURI();
+    return;
+  }
+  inp.select();
+  try { document.execCommand("copy"); showMsg("Share URI copied."); } catch(e) {}
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(inp.value);
+    showMsg("Share URI copied.");
+  }
+}
+
+function openCreateNode() {
+  var blank = {
+    id: "",
+    name: "",
+    protocol: "vless",
+    address: "",
+    port: 443,
+    outbound: {
+      tag: "proxy",
+      protocol: "vless",
+      settings: {vnext: [{address: "", port: 443, users: [{id: "", encryption: "none"}]}]},
+      streamSettings: {network: "tcp"}
+    }
+  };
+  currentEditTab = "visual";
+  populateEditModalFromNode(blank, true);
+  setEditTab("visual");
+  var m = document.getElementById("nodeEditModal");
+  m.className = "modal-bg";
+  m.style.display = "flex";
+}
+
 function openEditNode(id) {
   var node = null;
   for (var i = 0; i < cachedNodes.length; i++) {
     if (cachedNodes[i].id === id) { node = cachedNodes[i]; break; }
   }
   if (!node) return;
-  document.getElementById("editNodeId").value = node.id;
-  document.getElementById("editNodeName").value = node.name || "";
-  document.getElementById("editNodeAddress").value = node.address || "";
-  document.getElementById("editNodePort").value = node.port || 443;
-  document.getElementById("editNodeURI").value = "";
-
-  var sni = "";
-  if (node.outbound && node.outbound.streamSettings) {
-    var ss = node.outbound.streamSettings;
-    if (ss.tlsSettings && ss.tlsSettings.serverName) {
-      sni = ss.tlsSettings.serverName;
-    } else if (ss.realitySettings && ss.realitySettings.serverName) {
-      sni = ss.realitySettings.serverName;
-    }
-  }
-  document.getElementById("editNodeSNI").value = sni;
+  currentEditTab = "visual";
+  populateEditModalFromNode(node, false);
+  setEditTab("visual");
   var m = document.getElementById("nodeEditModal");
   m.className = "modal-bg";
   m.style.display = "flex";
@@ -4699,31 +7875,68 @@ function closeEditNode() {
 }
 
 function saveEditNode() {
+  showEditModalErr("");
   var id = document.getElementById("editNodeId").value;
-  var name = document.getElementById("editNodeName").value;
-  var addr = document.getElementById("editNodeAddress").value;
-  var port = parseInt(document.getElementById("editNodePort").value, 10) || 0;
-  var sni = document.getElementById("editNodeSNI").value;
+  var isNew = (document.getElementById("editNodeIsNew").value === "1");
   var uri = document.getElementById("editNodeURI").value;
+  var name = document.getElementById("editNodeName").value;
+  var actionName = isNew ? "create" : "edit";
+  var body;
 
-  showMsg("Saving node changes...");
-  req("POST", "/api/nodes", {
-    action: "edit",
-    id: id,
-    name: name,
-    address: addr,
-    port: port,
-    sni: sni,
-    uri: uri
-  }, function(code, text) {
+  if (uri && uri.trim()) {
+    body = {action: actionName, id: id, name: name, uri: uri.trim()};
+  } else if (currentEditTab === "json") {
+    var parsedOb;
+    try {
+      parsedOb = JSON.parse(document.getElementById("editNodeRawJSON").value);
+    } catch(e) {
+      showEditModalErr("Invalid Raw Outbound JSON: " + e.message);
+      return;
+    }
+    body = {action: actionName, id: id, name: name, outbound: parsedOb};
+  } else {
+    body = collectEditFormPayload(actionName, id);
+  }
+
+  showMsg(isNew ? "Creating node..." : "Saving node changes...");
+  req("POST", "/api/nodes", body, function(code, text) {
     if (code === 200) {
       closeEditNode();
-      showMsg("Node updated successfully.");
+      showMsg(isNew ? "Node created successfully." : "Node updated successfully.");
       refreshStatus();
     } else {
       var err = text;
       try { err = JSON.parse(text).error || text; } catch(e){}
+      showEditModalErr(err);
       showMsg("Error: " + err);
+    }
+  });
+}
+
+function duplicateEditNode() {
+  showEditModalErr("");
+  var name = document.getElementById("editNodeName").value || "Node";
+  var body;
+  if (currentEditTab === "json") {
+    try {
+      body = {action: "create", name: name + " (Copy)", outbound: JSON.parse(document.getElementById("editNodeRawJSON").value)};
+    } catch(e) {
+      showEditModalErr("Invalid Raw Outbound JSON: " + e.message);
+      return;
+    }
+  } else {
+    body = collectEditFormPayload("create", "");
+    body.name = name + " (Copy)";
+  }
+  req("POST", "/api/nodes", body, function(code, text) {
+    if (code === 200) {
+      closeEditNode();
+      showMsg("Duplicated node created.");
+      refreshStatus();
+    } else {
+      var err = text;
+      try { err = JSON.parse(text).error || text; } catch(e){}
+      showEditModalErr(err);
     }
   });
 }

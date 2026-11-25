@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2967,5 +2968,872 @@ func TestWebUIStatusTabAndEditModalElements(t *testing.T) {
 		if !strings.Contains(dashboardHTML, str) {
 			t.Errorf("dashboardHTML missing expected element: %s", str)
 		}
+	}
+}
+
+func setupIsolatedTestEnv(t *testing.T) string {
+	t.Helper()
+	tmpDir := t.TempDir()
+	origBaseDir := BaseDir
+	origBase := BaseConfig
+	origPersistBase := PersistBaseConfig
+	origState := StateFile
+	origPersistState := PersistStateFile
+	origPersistDir := PersistDir
+	origRuntime := RuntimeConfig
+	origXray := XrayBin
+
+	t.Cleanup(func() {
+		BaseDir = origBaseDir
+		BaseConfig = origBase
+		PersistBaseConfig = origPersistBase
+		StateFile = origState
+		PersistStateFile = origPersistState
+		PersistDir = origPersistDir
+		RuntimeConfig = origRuntime
+		XrayBin = origXray
+		invalidateStateCache()
+		invalidateModuleVersion()
+		invalidateXrayVersion()
+	})
+
+	BaseDir = filepath.Join(tmpDir, "mod")
+	PersistDir = filepath.Join(tmpDir, "persist")
+	BaseConfig = filepath.Join(BaseDir, "config", "config.json")
+	PersistBaseConfig = filepath.Join(PersistDir, "config.json")
+	StateFile = filepath.Join(BaseDir, "config", "state.json")
+	PersistStateFile = filepath.Join(PersistDir, "state.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+	XrayBin = "/nonexistent/xray"
+
+	_ = os.MkdirAll(filepath.Dir(BaseConfig), 0755)
+	_ = os.MkdirAll(PersistDir, 0755)
+	_ = os.WriteFile(BaseConfig, []byte(DefaultBaseConfigJSON), 0644)
+	_ = os.WriteFile(PersistBaseConfig, []byte(DefaultBaseConfigJSON), 0644)
+	invalidateStateCache()
+	return tmpDir
+}
+
+func TestBackupAndRestoreAPIAndBundle(t *testing.T) {
+	setupIsolatedTestEnv(t)
+
+	// 1. Populate non-default state & custom base config
+	bypassIranFalse := false
+	node, err := parseShareURI("vless://11111111-2222-3333-4444-555555555555@vpn.example.org:80?type=ws&security=none&path=%2Fws#PlainWS", "manual")
+	if err != nil {
+		t.Fatalf("parseShareURI failed: %v", err)
+	}
+	st := PanelState{
+		ProxyMode:          "global",
+		ActiveNode:         node.ID,
+		SubURL:             "https://sub.example.org/feed",
+		SubInsecure:        true,
+		AutoUpdateHours:    12,
+		LastSubUpdate:      "2026-11-25 10:00",
+		AppFilterMode:      "proxy",
+		SelectedUIDs:       []int{10101, 10202},
+		LocalhostProxy:     false,
+		AllowInsecureVless: true,
+		DNS: DNSConfig{
+			RemoteDNS:     "https://dns.google/dns-query",
+			DirectDNS:     "10.202.10.202",
+			QueryStrategy: "UseIP",
+		},
+		Geo: GeoConfig{
+			BypassIran:   &bypassIranFalse,
+			ProxyDomains: []string{"geosite:openai"},
+		},
+		Nodes: []NodeProfile{node},
+	}
+	if err := saveState(st); err != nil {
+		t.Fatalf("saveState failed: %v", err)
+	}
+	customCfg := `{"log":{"loglevel":"info"},"inbounds":[{"tag":"tproxy-in","listen":"0.0.0.0","port":12345,"protocol":"dokodemo-door"}],"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],"routing":{"rules":[{"type":"field","domain":["custom.org"],"outboundTag":"direct"}]}}`
+	if err := os.WriteFile(BaseConfig, []byte(customCfg), 0644); err != nil {
+		t.Fatalf("write BaseConfig failed: %v", err)
+	}
+
+	mux := buildWebMux()
+
+	// 2. Export backup via GET /api/backup?download=1
+	reqBk := httptest.NewRequest(http.MethodGet, "/api/backup?download=1", nil)
+	rrBk := httptest.NewRecorder()
+	mux.ServeHTTP(rrBk, reqBk)
+	if rrBk.Code != http.StatusOK {
+		t.Fatalf("GET /api/backup failed with %d: %s", rrBk.Code, rrBk.Body.String())
+	}
+	if disp := rrBk.Header().Get("Content-Disposition"); !strings.Contains(disp, "passwall-backup-") {
+		t.Errorf("unexpected Content-Disposition: %q", disp)
+	}
+	backupBytes := rrBk.Body.Bytes()
+
+	// 3. Wipe state and reset base config
+	if err := resetBaseConfig(); err != nil {
+		t.Fatalf("resetBaseConfig failed: %v", err)
+	}
+	_ = saveState(PanelState{ProxyMode: "direct", LocalhostProxy: true, Nodes: []NodeProfile{}})
+
+	// 4. Restore backup via POST /api/restore
+	reqRes := httptest.NewRequest(http.MethodPost, "/api/restore", bytes.NewReader(backupBytes))
+	rrRes := httptest.NewRecorder()
+	mux.ServeHTTP(rrRes, reqRes)
+	if rrRes.Code != http.StatusOK {
+		t.Fatalf("POST /api/restore failed with %d: %s", rrRes.Code, rrRes.Body.String())
+	}
+
+	restored := loadState()
+	if restored.ProxyMode != "global" {
+		t.Errorf("expected ProxyMode global, got %s", restored.ProxyMode)
+	}
+	if restored.LocalhostProxy != false {
+		t.Errorf("expected LocalhostProxy false to be preserved")
+	}
+	if !restored.AllowInsecureVless {
+		t.Errorf("expected AllowInsecureVless true to be preserved")
+	}
+	if len(restored.Nodes) != 1 || restored.Nodes[0].ID != node.ID {
+		t.Errorf("expected restored node %s, got %+v", node.ID, restored.Nodes)
+	}
+	if restored.Geo.IsBypassIran() {
+		t.Errorf("expected BypassIran false to be preserved")
+	}
+	if len(restored.Geo.ProxyDomains) != 1 || restored.Geo.ProxyDomains[0] != "geosite:openai" {
+		t.Errorf("expected ProxyDomains preserved, got %+v", restored.Geo.ProxyDomains)
+	}
+	if len(restored.SelectedUIDs) != 2 || restored.SelectedUIDs[1] != 10202 {
+		t.Errorf("expected SelectedUIDs preserved, got %v", restored.SelectedUIDs)
+	}
+
+	cfgBytes, err := os.ReadFile(BaseConfig)
+	if err != nil || !strings.Contains(string(cfgBytes), "custom.org") {
+		t.Errorf("expected custom BaseConfig to be restored, got: %s (err=%v)", string(cfgBytes), err)
+	}
+	persistCfgBytes, err := os.ReadFile(PersistBaseConfig)
+	if err != nil || !strings.Contains(string(persistCfgBytes), "custom.org") {
+		t.Errorf("expected PersistBaseConfig to be restored")
+	}
+
+	// 5. Also verify multipart/form-data upload and raw state.json restore & invalid payload errors
+	_ = saveState(PanelState{ProxyMode: "rule", LocalhostProxy: true, Nodes: []NodeProfile{}})
+	var mpBuf bytes.Buffer
+	mw := multipart.NewWriter(&mpBuf)
+	fw, err := mw.CreateFormFile("file", "backup.json")
+	if err != nil {
+		t.Fatalf("CreateFormFile failed: %v", err)
+	}
+	_, _ = fw.Write(backupBytes)
+	_ = mw.Close()
+
+	reqMp := httptest.NewRequest(http.MethodPost, "/api/restore", &mpBuf)
+	reqMp.Header.Set("Content-Type", mw.FormDataContentType())
+	rrMp := httptest.NewRecorder()
+	mux.ServeHTTP(rrMp, reqMp)
+	if rrMp.Code != http.StatusOK {
+		t.Fatalf("multipart /api/restore failed with %d: %s", rrMp.Code, rrMp.Body.String())
+	}
+	if stAfter := loadState(); stAfter.ProxyMode != "global" || !stAfter.AllowInsecureVless {
+		t.Errorf("multipart restore did not restore expected fields: %+v", stAfter)
+	}
+
+	// Invalid restore input returns 400
+	reqBad := httptest.NewRequest(http.MethodPost, "/api/restore", strings.NewReader(`{"format":"unknown","version":99}`))
+	rrBad := httptest.NewRecorder()
+	mux.ServeHTTP(rrBad, reqBad)
+	if rrBad.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid backup format, got %d", rrBad.Code)
+	}
+}
+
+func TestVlessSecurityBypassHelpersAndRuntimeBridge(t *testing.T) {
+	setupIsolatedTestEnv(t)
+
+	// 1. Address classification matching Xray-core
+	privateCases := []string{
+		"127.0.0.1", "10.0.0.5", "172.16.10.1", "192.168.1.100", "169.254.1.1",
+		"::1", "fc00::1", "fe80::1",
+		"localhost", "mybox.local", "gateway.lan", "vpn.internal", "app.home.arpa", "myhost",
+	}
+	for _, addr := range privateCases {
+		if !isPrivateOrLocalAddress(addr) {
+			t.Errorf("expected %q to be treated as private/local address", addr)
+		}
+	}
+
+	publicCases := []string{
+		"1.2.3.4", "198.51.100.25", "2001:4860:4860::8888",
+		"vpn.myserver.org", "cdn.cloudflare-site.net",
+	}
+	for _, addr := range publicCases {
+		if isPrivateOrLocalAddress(addr) {
+			t.Errorf("expected %q to require transport security (public address)", addr)
+		}
+	}
+
+	// 2. Public plain VLESS WS node without TLS or encryption
+	plainNode, err := parseShareURI("vless://b831381d-6324-4d53-ad4f-8cda48b30811@vpn.myserver.org:80?type=ws&security=none&path=%2Fws#PlainVless", "manual")
+	if err != nil {
+		t.Fatalf("parseShareURI failed: %v", err)
+	}
+	st := PanelState{
+		ProxyMode:          "rule",
+		ActiveNode:         plainNode.ID,
+		AllowInsecureVless: false,
+		LocalhostProxy:     true,
+		Nodes:              []NodeProfile{plainNode},
+	}
+	_ = saveState(st)
+
+	// Switcher OFF -> no bridge injected
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig failed: %v", err)
+	}
+	rawOff, _ := os.ReadFile(RuntimeConfig)
+	var cfgOff map[string]interface{}
+	_ = json.Unmarshal(rawOff, &cfgOff)
+	for _, item := range cfgOff["inbounds"].([]interface{}) {
+		inb := item.(map[string]interface{})
+		if strings.HasPrefix(fmt.Sprintf("%v", inb["tag"]), "vless-plain-bridge-") {
+			t.Fatalf("did not expect bridge inbound when AllowInsecureVless is false")
+		}
+	}
+
+	// Switcher ON via API -> bridge injected cleanly without mutating saved NodeProfile
+	mux := buildWebMux()
+	reqSw := httptest.NewRequest(http.MethodPost, "/api/vless_insecure", strings.NewReader(`{"allow_insecure_vless":true}`))
+	rrSw := httptest.NewRecorder()
+	mux.ServeHTTP(rrSw, reqSw)
+	if rrSw.Code != http.StatusOK {
+		t.Fatalf("POST /api/vless_insecure failed: %d %s", rrSw.Code, rrSw.Body.String())
+	}
+
+	// Check /api/status reports both allow_insecure_vless and vless_insecure_needed
+	reqSt := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	rrSt := httptest.NewRecorder()
+	mux.ServeHTTP(rrSt, reqSt)
+	var stResp map[string]interface{}
+	_ = json.Unmarshal(rrSt.Body.Bytes(), &stResp)
+	if stResp["allow_insecure_vless"] != true || stResp["vless_insecure_needed"] != true {
+		t.Errorf("unexpected status flags: allow=%v needed=%v", stResp["allow_insecure_vless"], stResp["vless_insecure_needed"])
+	}
+
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig with bypass failed: %v", err)
+	}
+	rawOn, _ := os.ReadFile(RuntimeConfig)
+	var cfgOn map[string]interface{}
+	_ = json.Unmarshal(rawOn, &cfgOn)
+
+	// Verify bridge inbound and proxy outbound rewrite
+	var bridgeInbound map[string]interface{}
+	for _, item := range cfgOn["inbounds"].([]interface{}) {
+		inb := item.(map[string]interface{})
+		if inb["tag"] == "vless-plain-bridge-0" {
+			bridgeInbound = inb
+			break
+		}
+	}
+	if bridgeInbound == nil {
+		t.Fatalf("expected vless-plain-bridge-0 inbound in runtime config")
+	}
+	bSettings := bridgeInbound["settings"].(map[string]interface{})
+	if bSettings["address"] != "vpn.myserver.org" || int(bSettings["port"].(float64)) != 80 {
+		t.Errorf("unexpected bridge target: %+v", bSettings)
+	}
+	bridgePort := int(bridgeInbound["port"].(float64))
+
+	var proxyOb map[string]interface{}
+	for _, item := range cfgOn["outbounds"].([]interface{}) {
+		ob := item.(map[string]interface{})
+		if ob["tag"] == "proxy" {
+			proxyOb = ob
+			break
+		}
+	}
+	pVnext := proxyOb["settings"].(map[string]interface{})["vnext"].([]interface{})[0].(map[string]interface{})
+	if pVnext["address"] != "127.0.0.1" || int(pVnext["port"].(float64)) != bridgePort {
+		t.Errorf("expected proxy outbound rewritten to 127.0.0.1:%d, got %+v", bridgePort, pVnext)
+	}
+	pWS := proxyOb["streamSettings"].(map[string]interface{})["wsSettings"].(map[string]interface{})
+	if pWS["host"] != "vpn.myserver.org" {
+		t.Errorf("expected wsSettings.host preserved as vpn.myserver.org, got %v", pWS["host"])
+	}
+
+	// Verify first routing rule routes vless-plain-bridge-0 to direct
+	rules := cfgOn["routing"].(map[string]interface{})["rules"].([]interface{})
+	firstRule := rules[0].(map[string]interface{})
+	if firstRule["outboundTag"] != "direct" {
+		t.Errorf("expected first rule to route bridge to direct, got %+v", firstRule)
+	}
+
+	// Verify original saved NodeProfile was NOT mutated
+	stSaved := loadState()
+	origVnext := stSaved.Nodes[0].Outbound["settings"].(map[string]interface{})["vnext"].([]interface{})[0].(map[string]interface{})
+	if origVnext["address"] != "vpn.myserver.org" {
+		t.Errorf("saved node outbound was mutated! got %v", origVnext["address"])
+	}
+
+	// 3. Verify VLESS with encryption or TLS or private IP is NOT bridged even with switcher ON
+	encNode, err := parseShareURI("vless://b831381d-6324-4d53-ad4f-8cda48b30811@vpn.myserver.org:80?encryption=mlkem768x25519plus.native.1rtt.abc&security=none#EncVless", "manual")
+	if err != nil {
+		t.Fatalf("parseShareURI encrypted vless failed: %v", err)
+	}
+	if _, _, _, needs := vlessOutboundNeedsSecurityBypass(encNode.Outbound); needs {
+		t.Errorf("expected VLESS with mlkem768 encryption not to require security bypass")
+	}
+	privNode, _ := parseShareURI("vless://b831381d-6324-4d53-ad4f-8cda48b30811@192.168.1.50:80?security=none#PrivVless", "manual")
+	if _, _, _, needs := vlessOutboundNeedsSecurityBypass(privNode.Outbound); needs {
+		t.Errorf("expected VLESS on private IP 192.168.1.50 not to require security bypass")
+	}
+}
+
+func TestFullNodeEditorCreateEditExportAndRawJSON(t *testing.T) {
+	setupIsolatedTestEnv(t)
+	mux := buildWebMux()
+
+	// 1. Create a new VLESS + xhttp + Reality node from scratch using full_edit fields
+	createPayload := `{
+		"action": "create",
+		"full_edit": true,
+		"name": "FullVlessNode",
+		"protocol": "vless",
+		"address": "node1.example.org",
+		"port": 443,
+		"uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+		"flow": "",
+		"encryption": "none",
+		"network": "xhttp",
+		"host": "cdn.example.org",
+		"path": "/xhttp-v1",
+		"xhttp_mode": "packet-up",
+		"security": "reality",
+		"sni": "www.microsoft.com",
+		"fp": "chrome",
+		"pbk": "REALITY_PUB_KEY",
+		"sid": "a1b2",
+		"spx": "/spx",
+		"activate": true
+	}`
+	reqCr := httptest.NewRequest(http.MethodPost, "/api/nodes", strings.NewReader(createPayload))
+	rrCr := httptest.NewRecorder()
+	mux.ServeHTTP(rrCr, reqCr)
+	if rrCr.Code != http.StatusOK {
+		t.Fatalf("create full node failed: %d %s", rrCr.Code, rrCr.Body.String())
+	}
+	var crResp map[string]interface{}
+	_ = json.Unmarshal(rrCr.Body.Bytes(), &crResp)
+	nodeID, _ := crResp["id"].(string)
+	if nodeID == "" {
+		t.Fatalf("expected created node id")
+	}
+
+	st := loadState()
+	if len(st.Nodes) != 1 || st.ActiveNode != nodeID {
+		t.Fatalf("expected 1 active node %s, got %+v", nodeID, st)
+	}
+	created := st.Nodes[0]
+	ss := created.Outbound["streamSettings"].(map[string]interface{})
+	if ss["network"] != "xhttp" || ss["security"] != "reality" {
+		t.Errorf("unexpected streamSettings: %+v", ss)
+	}
+	xh := ss["xhttpSettings"].(map[string]interface{})
+	if xh["path"] != "/xhttp-v1" || xh["host"] != "cdn.example.org" || xh["mode"] != "packet-up" {
+		t.Errorf("unexpected xhttpSettings: %+v", xh)
+	}
+
+	// 2. Edit node protocol & transport via full_edit (convert to Trojan + gRPC + TLS)
+	editPayload := fmt.Sprintf(`{
+		"action": "edit",
+		"full_edit": true,
+		"id": %q,
+		"name": "EditedTrojanNode",
+		"protocol": "trojan",
+		"address": "trojan.example.org",
+		"port": 8443,
+		"password": "super-secret-password",
+		"network": "grpc",
+		"service_name": "myGrpcSvc",
+		"grpc_multi_mode": true,
+		"grpc_authority": "auth.example.org",
+		"security": "tls",
+		"sni": "trojan.example.org",
+		"fp": "firefox",
+		"alpn": "h2,http/1.1",
+		"allow_insecure": true
+	}`, nodeID)
+	reqEd := httptest.NewRequest(http.MethodPost, "/api/nodes", strings.NewReader(editPayload))
+	rrEd := httptest.NewRecorder()
+	mux.ServeHTTP(rrEd, reqEd)
+	if rrEd.Code != http.StatusOK {
+		t.Fatalf("full edit failed: %d %s", rrEd.Code, rrEd.Body.String())
+	}
+
+	st2 := loadState()
+	edited := st2.Nodes[0]
+	if edited.Protocol != "trojan" || edited.Address != "trojan.example.org" || edited.Port != 8443 {
+		t.Errorf("unexpected edited node metadata: %+v", edited)
+	}
+	gs := edited.Outbound["streamSettings"].(map[string]interface{})["grpcSettings"].(map[string]interface{})
+	if gs["serviceName"] != "myGrpcSvc" || gs["multiMode"] != true || gs["authority"] != "auth.example.org" {
+		t.Errorf("unexpected grpcSettings: %+v", gs)
+	}
+
+	// 3. Export URI and parse_uri round-trip
+	reqExp := httptest.NewRequest(http.MethodPost, "/api/nodes", strings.NewReader(fmt.Sprintf(`{"action":"export_uri","id":%q}`, nodeID)))
+	rrExp := httptest.NewRecorder()
+	mux.ServeHTTP(rrExp, reqExp)
+	if rrExp.Code != http.StatusOK {
+		t.Fatalf("export_uri failed: %d %s", rrExp.Code, rrExp.Body.String())
+	}
+	var expResp map[string]string
+	_ = json.Unmarshal(rrExp.Body.Bytes(), &expResp)
+	if !strings.HasPrefix(expResp["uri"], "trojan://super-secret-password@trojan.example.org:8443") {
+		t.Errorf("unexpected exported URI: %s", expResp["uri"])
+	}
+
+	reqParse := httptest.NewRequest(http.MethodPost, "/api/nodes", strings.NewReader(fmt.Sprintf(`{"action":"parse_uri","uri":%q}`, expResp["uri"])))
+	rrParse := httptest.NewRecorder()
+	mux.ServeHTTP(rrParse, reqParse)
+	if rrParse.Code != http.StatusOK {
+		t.Fatalf("parse_uri failed: %d %s", rrParse.Code, rrParse.Body.String())
+	}
+
+	// 4. Edit via raw Outbound JSON (Hysteria2)
+	rawEditPayload := fmt.Sprintf(`{
+		"action": "edit",
+		"id": %q,
+		"name": "RawHy2",
+		"outbound": {
+			"protocol": "hysteria",
+			"settings": {"version": 2, "address": "hy2.example.org", "port": 9443},
+			"streamSettings": {
+				"network": "hysteria",
+				"security": "tls",
+				"tlsSettings": {"serverName": "hy2.example.org", "alpn": ["h3"]},
+				"hysteriaSettings": {"version": 2, "auth": "hy2pass"}
+			}
+		}
+	}`, nodeID)
+	reqRaw := httptest.NewRequest(http.MethodPost, "/api/nodes", strings.NewReader(rawEditPayload))
+	rrRaw := httptest.NewRecorder()
+	mux.ServeHTTP(rrRaw, reqRaw)
+	if rrRaw.Code != http.StatusOK {
+		t.Fatalf("raw outbound edit failed: %d %s", rrRaw.Code, rrRaw.Body.String())
+	}
+	st3 := loadState()
+	if st3.Nodes[0].Protocol != "hysteria2" || st3.Nodes[0].Address != "hy2.example.org" || st3.Nodes[0].Port != 9443 {
+		t.Errorf("raw outbound sync mismatch: %+v", st3.Nodes[0])
+	}
+}
+
+func TestWebUINewFeaturesElements(t *testing.T) {
+	checks := []string{
+		`id="allowInsecureVlessChk"`,
+		`id="vlessInsecureAlert"`,
+		`function toggleAllowInsecureVless(`,
+		`/api/vless_insecure`,
+		`id="btnDownloadBackup"`,
+		`id="restoreFileInput"`,
+		`id="btnRestoreBackup"`,
+		`function downloadBackup()`,
+		`function restoreBackup()`,
+		`/api/backup`,
+		`/api/restore`,
+		`id="btnNewNode"`,
+		`id="editNodeProtocol"`,
+		`id="editNodeUUID"`,
+		`id="editNodeFlow"`,
+		`id="editNodeVlessEncryption"`,
+		`id="editNodeNetwork"`,
+		`id="editNodeSecurity"`,
+		`id="editNodeRealityPBK"`,
+		`id="editNodeRawJSON"`,
+		`function openCreateNode()`,
+		`function setEditTab(`,
+		`function duplicateEditNode()`,
+		`id="dnsRedirectChk"`,
+		`id="dnsRemoteStrategySel"`,
+		`id="dnsDirectStrategySel"`,
+		`id="geoDomainStrategySel"`,
+		`id="geoDomainMatcherSel"`,
+		`id="editNodeDomainStrategy"`,
+		`function applyDNSUI(`,
+	}
+	for _, str := range checks {
+		if !strings.Contains(dashboardHTML, str) {
+			t.Errorf("dashboardHTML missing expected element: %s", str)
+		}
+	}
+}
+
+func TestPasswall2DirectAndRemoteQueryStrategies(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBase := BaseConfig
+	origPersistBase := PersistBaseConfig
+	origState := StateFile
+	origPersistState := PersistStateFile
+	origRuntime := RuntimeConfig
+	defer func() {
+		BaseConfig = origBase
+		PersistBaseConfig = origPersistBase
+		StateFile = origState
+		PersistStateFile = origPersistState
+		RuntimeConfig = origRuntime
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	PersistBaseConfig = filepath.Join(tmpDir, "persist_config.json")
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+	if err := os.WriteFile(BaseConfig, []byte(DefaultBaseConfigJSON), 0644); err != nil {
+		t.Fatalf("write base config: %v", err)
+	}
+
+	testNode := NodeProfile{
+		ID:       "n1",
+		Name:     "Proxy1",
+		Protocol: "vless",
+		Address:  "vpn.example.com",
+		Port:     443,
+		Outbound: map[string]interface{}{
+			"tag":      "proxy",
+			"protocol": "vless",
+			"settings": map[string]interface{}{
+				"vnext": []interface{}{
+					map[string]interface{}{"address": "vpn.example.com", "port": 443, "users": []interface{}{map[string]interface{}{"id": "uuid", "encryption": "none"}}},
+				},
+			},
+			"streamSettings": map[string]interface{}{"network": "tcp", "security": "tls"},
+		},
+	}
+
+	st := PanelState{
+		ProxyMode:  "rule",
+		ActiveNode: "n1",
+		DNS: DNSConfig{
+			RemoteDNS:           "https://1.1.1.1/dns-query",
+			DirectDNS:           "10.202.10.202",
+			DirectQueryStrategy: "UseIPv6",
+			RemoteQueryStrategy: "UseIPv4",
+		},
+		Nodes: []NodeProfile{testNode},
+	}
+	if err := saveState(st); err != nil {
+		t.Fatalf("saveState: %v", err)
+	}
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig: %v", err)
+	}
+
+	raw, _ := os.ReadFile(RuntimeConfig)
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("unmarshal runtime config: %v", err)
+	}
+
+	dnsCfg := cfg["dns"].(map[string]interface{})
+	if dnsCfg["queryStrategy"] != "UseIP" {
+		t.Errorf("mixed direct=UseIPv6 + remote=UseIPv4 must yield top-level queryStrategy UseIP, got %v", dnsCfg["queryStrategy"])
+	}
+	servers := dnsCfg["servers"].([]interface{})
+	directSrv := servers[0].(map[string]interface{})
+	remoteSrv := servers[1].(map[string]interface{})
+	directFallbackSrv := servers[2].(map[string]interface{})
+	if directSrv["queryStrategy"] != "UseIPv6" {
+		t.Errorf("expected direct server[0] queryStrategy UseIPv6, got %v", directSrv["queryStrategy"])
+	}
+	if remoteSrv["queryStrategy"] != "UseIPv4" {
+		t.Errorf("expected remote server[1] queryStrategy UseIPv4, got %v", remoteSrv["queryStrategy"])
+	}
+	if directFallbackSrv["queryStrategy"] != "UseIPv6" {
+		t.Errorf("expected direct fallback server[2] queryStrategy UseIPv6, got %v", directFallbackSrv["queryStrategy"])
+	}
+
+	outbounds := cfg["outbounds"].([]interface{})
+	foundDirect := false
+	for _, ob := range outbounds {
+		m := ob.(map[string]interface{})
+		if m["tag"] == "direct" {
+			foundDirect = true
+			sock := m["streamSettings"].(map[string]interface{})["sockopt"].(map[string]interface{})
+			if sock["domainStrategy"] != "UseIPv6" {
+				t.Errorf("expected direct outbound sockopt.domainStrategy UseIPv6, got %v", sock["domainStrategy"])
+			}
+		}
+	}
+	if !foundDirect {
+		t.Fatal("direct outbound missing")
+	}
+
+	// Same strategy on both sides sets top-level to that shared strategy
+	st.DNS.DirectQueryStrategy = "UseIPv6"
+	st.DNS.RemoteQueryStrategy = "UseIPv6"
+	_ = saveState(st)
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig UseIPv6/UseIPv6: %v", err)
+	}
+	raw, _ = os.ReadFile(RuntimeConfig)
+	_ = json.Unmarshal(raw, &cfg)
+	if cfg["dns"].(map[string]interface{})["queryStrategy"] != "UseIPv6" {
+		t.Errorf("expected top-level queryStrategy UseIPv6 when both match, got %v", cfg["dns"].(map[string]interface{})["queryStrategy"])
+	}
+
+	// Legacy upgrade: only QueryStrategy set in state.json
+	legacyPath := filepath.Join(tmpDir, "legacy_state.json")
+	StateFile = legacyPath
+	PersistStateFile = filepath.Join(tmpDir, "legacy_persist_state.json")
+	if err := os.WriteFile(legacyPath, []byte(`{"dns":{"remote_dns":"tcp://8.8.8.8","direct_dns":"223.5.5.5","query_strategy":"UseIP"}}`), 0644); err != nil {
+		t.Fatalf("write legacy state: %v", err)
+	}
+	legacyLoaded := loadState()
+	if legacyLoaded.DNS.EffectiveDirectQueryStrategy() != "UseIP" || legacyLoaded.DNS.EffectiveRemoteQueryStrategy() != "UseIP" {
+		t.Errorf("legacy QueryStrategy did not propagate: %+v", legacyLoaded.DNS)
+	}
+	if !legacyLoaded.DNS.IsDNSRedirect() {
+		t.Errorf("expected DNSRedirect to default true for legacy state")
+	}
+}
+
+func TestPasswall2DNSRedirectAndRoutingOptions(t *testing.T) {
+	tmpDir := t.TempDir()
+	origBase := BaseConfig
+	origPersistBase := PersistBaseConfig
+	origState := StateFile
+	origPersistState := PersistStateFile
+	origRuntime := RuntimeConfig
+	defer func() {
+		BaseConfig = origBase
+		PersistBaseConfig = origPersistBase
+		StateFile = origState
+		PersistStateFile = origPersistState
+		RuntimeConfig = origRuntime
+	}()
+
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	PersistBaseConfig = filepath.Join(tmpDir, "persist_config.json")
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+	RuntimeConfig = filepath.Join(tmpDir, "runtime.json")
+	_ = os.WriteFile(BaseConfig, []byte(DefaultBaseConfigJSON), 0644)
+
+	boolFalse := false
+	st := PanelState{
+		ProxyMode: "rule",
+		DNS: DNSConfig{
+			DNSRedirect: &boolFalse,
+		},
+		Geo: GeoConfig{
+			DomainStrategy: "IPOnDemand",
+			DomainMatcher:  "linear",
+		},
+	}
+	_ = saveState(st)
+	if err := prepareRuntimeConfig(true); err != nil {
+		t.Fatalf("prepareRuntimeConfig: %v", err)
+	}
+
+	raw, _ := os.ReadFile(RuntimeConfig)
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	routing := cfg["routing"].(map[string]interface{})
+	if routing["domainStrategy"] != "IPOnDemand" {
+		t.Errorf("expected routing.domainStrategy IPOnDemand, got %v", routing["domainStrategy"])
+	}
+	if routing["domainMatcher"] != "linear" {
+		t.Errorf("expected routing.domainMatcher linear, got %v", routing["domainMatcher"])
+	}
+
+	hasTproxy53DnsOut := false
+	hasDnsInDnsOut := false
+	for _, r := range routing["rules"].([]interface{}) {
+		rm := r.(map[string]interface{})
+		if rm["outboundTag"] == "dns-out" {
+			if port, _ := rm["port"].(string); port == "53" {
+				hasTproxy53DnsOut = true
+			}
+			if inb, ok := rm["inboundTag"].([]interface{}); ok && len(inb) == 1 && inb[0] == "dns-in" {
+				hasDnsInDnsOut = true
+			}
+		}
+	}
+	if hasTproxy53DnsOut {
+		t.Errorf("expected port 53 tproxy/socks -> dns-out rule to be omitted when dns_redirect=false")
+	}
+	if !hasDnsInDnsOut {
+		t.Errorf("expected dns-in -> dns-out rule to remain even when dns_redirect=false")
+	}
+
+	// Re-enable DNSRedirect + AsIs + hybrid
+	boolTrue := true
+	st.DNS.DNSRedirect = &boolTrue
+	st.Geo.DomainStrategy = "AsIs"
+	st.Geo.DomainMatcher = "hybrid"
+	_ = saveState(st)
+	_ = prepareRuntimeConfig(true)
+
+	raw, _ = os.ReadFile(RuntimeConfig)
+	_ = json.Unmarshal(raw, &cfg)
+	routing = cfg["routing"].(map[string]interface{})
+	if routing["domainStrategy"] != "AsIs" || routing["domainMatcher"] != "hybrid" {
+		t.Errorf("expected AsIs/hybrid, got %v / %v", routing["domainStrategy"], routing["domainMatcher"])
+	}
+	hasTproxy53DnsOut = false
+	for _, r := range routing["rules"].([]interface{}) {
+		rm := r.(map[string]interface{})
+		if rm["outboundTag"] == "dns-out" && rm["port"] == "53" {
+			hasTproxy53DnsOut = true
+		}
+	}
+	if !hasTproxy53DnsOut {
+		t.Errorf("expected port 53 dns-out rule when dns_redirect=true")
+	}
+}
+
+func TestPasswall2APIsBackupAndSockoptDomainStrategy(t *testing.T) {
+	tmpDir := t.TempDir()
+	origState := StateFile
+	origPersistState := PersistStateFile
+	origBase := BaseConfig
+	origPersistBase := PersistBaseConfig
+	defer func() {
+		StateFile = origState
+		PersistStateFile = origPersistState
+		BaseConfig = origBase
+		PersistBaseConfig = origPersistBase
+	}()
+
+	StateFile = filepath.Join(tmpDir, "state.json")
+	PersistStateFile = filepath.Join(tmpDir, "persist_state.json")
+	BaseConfig = filepath.Join(tmpDir, "config.json")
+	PersistBaseConfig = filepath.Join(tmpDir, "persist_config.json")
+	_ = os.WriteFile(BaseConfig, []byte(DefaultBaseConfigJSON), 0644)
+
+	mux := buildWebMux()
+
+	// 1. Reject invalid DNS strategy
+	rrBadDNS := httptest.NewRecorder()
+	mux.ServeHTTP(rrBadDNS, httptest.NewRequest(http.MethodPost, "/api/dns", strings.NewReader(`{"direct_query_strategy":"BadVal"}`)))
+	if rrBadDNS.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid direct_query_strategy, got %d", rrBadDNS.Code)
+	}
+
+	// 2. Save valid Passwall 2 DNS settings
+	rrDNS := httptest.NewRecorder()
+	mux.ServeHTTP(rrDNS, httptest.NewRequest(http.MethodPost, "/api/dns", strings.NewReader(`{
+		"remote_dns":"https://dns.google/dns-query",
+		"direct_dns":"77.88.8.8",
+		"direct_query_strategy":"UseIP",
+		"remote_query_strategy":"UseIPv6",
+		"dns_redirect":false
+	}`)))
+	if rrDNS.Code != http.StatusOK {
+		t.Fatalf("POST /api/dns failed: %d %s", rrDNS.Code, rrDNS.Body.String())
+	}
+
+	rrDNSGet := httptest.NewRecorder()
+	mux.ServeHTTP(rrDNSGet, httptest.NewRequest(http.MethodGet, "/api/dns", nil))
+	var dnsResp DNSConfig
+	_ = json.Unmarshal(rrDNSGet.Body.Bytes(), &dnsResp)
+	if dnsResp.DirectQueryStrategy != "UseIP" || dnsResp.RemoteQueryStrategy != "UseIPv6" || dnsResp.IsDNSRedirect() {
+		t.Fatalf("unexpected GET /api/dns response: %+v", dnsResp)
+	}
+
+	// 3. Reject invalid Geo routing options
+	rrBadGeo := httptest.NewRecorder()
+	mux.ServeHTTP(rrBadGeo, httptest.NewRequest(http.MethodPost, "/api/geo", strings.NewReader(`{"domain_strategy":"BadStrategy"}`)))
+	if rrBadGeo.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid domain_strategy, got %d", rrBadGeo.Code)
+	}
+	rrBadMatcher := httptest.NewRecorder()
+	mux.ServeHTTP(rrBadMatcher, httptest.NewRequest(http.MethodPost, "/api/geo", strings.NewReader(`{"domain_matcher":"mph-only"}`)))
+	if rrBadMatcher.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid domain_matcher, got %d", rrBadMatcher.Code)
+	}
+
+	// 4. Save valid DomainStrategy & DomainMatcher via /api/geo
+	rrGeo := httptest.NewRecorder()
+	mux.ServeHTTP(rrGeo, httptest.NewRequest(http.MethodPost, "/api/geo", strings.NewReader(`{
+		"domain_strategy":"IPOnDemand",
+		"domain_matcher":"linear"
+	}`)))
+	if rrGeo.Code != http.StatusOK {
+		t.Fatalf("POST /api/geo failed: %d %s", rrGeo.Code, rrGeo.Body.String())
+	}
+	rrGeoGet := httptest.NewRecorder()
+	mux.ServeHTTP(rrGeoGet, httptest.NewRequest(http.MethodGet, "/api/geo", nil))
+	var geoResp map[string]interface{}
+	_ = json.Unmarshal(rrGeoGet.Body.Bytes(), &geoResp)
+	if geoResp["domain_strategy"] != "IPOnDemand" || geoResp["domain_matcher"] != "linear" {
+		t.Fatalf("unexpected GET /api/geo domain options: %v", geoResp)
+	}
+
+	// 5. Create node with per-node sockopt.domainStrategy even for plain Shadowsocks, then clear it
+	rrCreate := httptest.NewRecorder()
+	mux.ServeHTTP(rrCreate, httptest.NewRequest(http.MethodPost, "/api/nodes", strings.NewReader(`{
+		"action":"create",
+		"full_edit":true,
+		"name":"SS-Sockopt",
+		"protocol":"shadowsocks",
+		"address":"ss.example.org",
+		"port":8388,
+		"password":"secret",
+		"ss_method":"aes-256-gcm",
+		"network":"tcp",
+		"security":"none",
+		"sockopt_domain_strategy":"UseIPv4"
+	}`)))
+	if rrCreate.Code != http.StatusOK {
+		t.Fatalf("create ss node failed: %d %s", rrCreate.Code, rrCreate.Body.String())
+	}
+	stAfterCreate := loadState()
+	if len(stAfterCreate.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(stAfterCreate.Nodes))
+	}
+	createdNode := stAfterCreate.Nodes[0]
+	sockDS := createdNode.Outbound["streamSettings"].(map[string]interface{})["sockopt"].(map[string]interface{})["domainStrategy"]
+	if sockDS != "UseIPv4" {
+		t.Errorf("expected sockopt.domainStrategy UseIPv4 on created node, got %v", sockDS)
+	}
+
+	// 6. Backup & Restore preserves all Passwall 2 fields
+	rrBkp := httptest.NewRecorder()
+	mux.ServeHTTP(rrBkp, httptest.NewRequest(http.MethodGet, "/api/backup", nil))
+	if rrBkp.Code != http.StatusOK {
+		t.Fatalf("backup failed: %d", rrBkp.Code)
+	}
+	// Reset state first
+	_ = saveState(PanelState{ProxyMode: "direct"})
+	rrRes := httptest.NewRecorder()
+	mux.ServeHTTP(rrRes, httptest.NewRequest(http.MethodPost, "/api/restore", bytes.NewReader(rrBkp.Body.Bytes())))
+	if rrRes.Code != http.StatusOK {
+		t.Fatalf("restore failed: %d %s", rrRes.Code, rrRes.Body.String())
+	}
+	restored := loadState()
+	if restored.DNS.DirectQueryStrategy != "UseIP" || restored.DNS.RemoteQueryStrategy != "UseIPv6" || restored.DNS.IsDNSRedirect() {
+		t.Errorf("DNS settings not preserved after restore: %+v", restored.DNS)
+	}
+	if restored.Geo.EffectiveDomainStrategy() != "IPOnDemand" || restored.Geo.EffectiveDomainMatcher() != "linear" {
+		t.Errorf("Geo domain strategy/matcher not preserved after restore: %+v", restored.Geo)
+	}
+
+	// Clear sockopt_domain_strategy back to Auto ("")
+	clearDS := ""
+	if err := applyNodeEditRequest(&restored.Nodes[0], NodeEditRequest{
+		FullEdit:              true,
+		Protocol:              "shadowsocks",
+		Address:               "ss.example.org",
+		Port:                  8388,
+		Password:              "secret",
+		SSMethod:              "aes-256-gcm",
+		Network:               "tcp",
+		Security:              "none",
+		SockoptDomainStrategy: &clearDS,
+	}); err != nil {
+		t.Fatalf("clear sockopt_domain_strategy: %v", err)
+	}
+	if _, hasSS := restored.Nodes[0].Outbound["streamSettings"]; hasSS {
+		t.Errorf("expected streamSettings to be cleaned up when clearing sockopt_domain_strategy on plain shadowsocks, got %v", restored.Nodes[0].Outbound["streamSettings"])
 	}
 }
